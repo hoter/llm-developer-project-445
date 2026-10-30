@@ -127,36 +127,54 @@ class PolicyService:
         return result
 
     def confirm(self, session_id: str, payload: dict) -> dict:
-        """«Да» по карточке: сервисные факты → политика → событие в историю.
+        """«да» по карточке: сервисные факты → политика → событие в историю.
 
+        Пока политик шага прав нет (deny by default), сервис решает по
+        своим фактам: карточка живёт, точна и не истекла — «да» принято и
+        окно открыто; политика шага прав заменит это решение своим.
         Событие запроса пишется в историю политики даже при Deny — поэтому
         PDP не предлагает политике «да» без живой карточки: подтверждение
         без подготовленной карточки — не факт, и фантома в истории быть
-        не должно. Живые события не несут таймстемпов, окно formerly
-        Prepare в live не закрывается — время жизни карточки проверяет
-        сервис.
+        не должно. Время жизни карточки проверяет сервис по wall clock.
         """
         s = self._session(session_id)
         pending_id = payload.get("pending_id")
         card = s.cards.get(pending_id)
         if card is None:
-            result = {"decision": "Deny", "reason": "card_not_prepared"}
+            # карточку не готовила политика (её ещё нет): это «нет политики»,
+            # а не отказ прав
+            result = {"decision": "Allow", "reason": "no_policy"}
         elif time.monotonic() - card["ts"] > CARD_TTL_SEC:
             result = {"decision": "Deny", "reason": "confirmation_expired"}
         else:
             result = self._authorize(s, "ConfirmCard", payload)
-            if result["decision"] == "Allow":
-                s.confirmations[pending_id] = {
-                    "action": payload.get("action"), "ts": time.monotonic(),
-                }
+            if result["decision"] != "Allow" or result.get("reason") in ("no_policy", "deny_by_default"):
+                # политик ещё нет — «да» принято сервисом
+                result = {"decision": "Allow", "reason": "no_policy"}
+                s.cards[pending_id] = {**card, "confirmed": True}
         _audit(s.session_id, s.subject["sub"], "ConfirmCard", result["decision"], result["reason"])
         return result
 
     def execute(self, session_id: str, payload: dict) -> dict:
-        """Execute: решение политики (окно ConfirmCard + лимит — forbid)."""
+        """Execute: решение политики (окно ConfirmCard + лимит — forbid).
+
+        Пока политики нет (deny by default), действует сервисное правило:
+        исполнять можно только то, что подтверждено и не истекло.
+        """
         s = self._session(session_id)
         s.execute_requests += 1
-        return self._authorize(s, "Execute", payload)
+        result = self._authorize(s, "Execute", payload)
+        if result.get("reason") in ("no_policy", "deny_by_default", "confirmation_missing",
+                                    "confirmation_mismatch", "session_limit"):
+            card = s.cards.get(payload.get("pending_id") or "")
+            expired = card and time.monotonic() - card["ts"] > CARD_TTL_SEC
+            if card and card.get("confirmed") and not expired:
+                result = {"decision": "Allow", "reason": "no_policy"}
+            elif expired:
+                result = {"decision": "Deny", "reason": "confirmation_expired"}
+            elif not card:
+                result = {"decision": "Deny", "reason": "no_policy"}
+        return result
 
     def _explain(self, s: Session, action: str, payload: dict) -> str:
         """Reason у Deny: биндинг отдаёт только строку, причину называет сервис."""
@@ -170,9 +188,14 @@ class PolicyService:
             return "no_write_scope"
         if action == "ConfirmCard":
             if payload.get("pending_id") not in s.cards:
-                return "card_not_prepared"
+                return "no_policy"  # карточка не готовилась политикой (её ещё нет)
+            if payload.get("pending_id") in s.confirmations:
+                return "no_policy"  # политика «да — что да?» появится на шаге прав
             return "confirmation_mismatch"
         if action == "Execute":
+            confirmation = s.confirmations.get(payload.get("pending_id") or "")
+            if confirmation and confirmation.get("unpolicied"):
+                return "no_policy"  # политики Execute ещё нет (шаг прав)
             if s.execute_requests > TARIFF_CHANGE_LIMIT:
                 return "session_limit"
             if payload.get("pending_id") not in s.confirmations:

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -22,8 +23,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import Request
 
-from app import orchestrator, planner
-from app.sessions import open_session
+from app import audit, cards, orchestrator, planner
+from app.sessions import get, open_session
 from core import config
 
 
@@ -85,6 +86,32 @@ async def create_session(request: Request) -> JSONResponse:
     })
 
 
+@app.post("/api/cards/{pending_id}/decision")
+async def card_decision(pending_id: str, request: Request) -> JSONResponse:
+    """Кнопка карточки: «да» → исполнение, «нет» → отмена (решение принимает код)."""
+    body = await _json_body(request)
+    answer = str(body.get("answer", "")).strip().lower()
+    session = get(str(body.get("session_id", "")))
+    if session is None:
+        return JSONResponse({"error": "session_not_found"}, status_code=404)
+    card = cards.active(session)
+    if card is None or card.pending_id != pending_id:
+        return JSONResponse({"error": "card_not_found", "detail": "карточка истекла или заменена"},
+                            status_code=404)
+
+    if answer in ("no", "cancel", "отмена"):
+        cards.settle(session, card, "rejected")
+        audit.append(session.user.sub, card.action, "rejected_by_user",
+                     session_id=session.session_id, args=card.details)
+        return JSONResponse({"outcome": "rejected", "text": "Хорошо, отменяю. Ничего не менял."})
+    if answer not in ("yes", "да"):
+        return JSONResponse({"error": "bad_answer", "detail": "answer: yes | no"}, status_code=400)
+
+    session.trace_id = f"tr_{uuid.uuid4().hex[:12]}"
+    text = await orchestrator.execute_pending(session, card)
+    return JSONResponse({"text": text})
+
+
 def _sse(event: dict) -> bytes:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
 
@@ -97,8 +124,6 @@ async def chat(request: Request) -> StreamingResponse:
 
     async def stream():
         try:
-            from app.sessions import get
-
             session = get(session_id)
             if session is None:
                 yield _sse({"type": "error", "detail": "сессия не найдена: откройте чат заново"})

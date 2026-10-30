@@ -64,7 +64,7 @@ PLANNER_PROMPT = """\
 - tariff — изменения тарифа, услуг и контактов абонента. Шаг с action=true.
   Агент только готовит карточку подтверждения, исполняет человек.
 - tickets — обращение к оператору поддержки, когда вопрос вне тем
-  оператора. Шаг с action=true.
+  оператора или нужен живой человек. Шаг с action=true.
 - support — карточка абонента для оператора поддержки (только у роли
   operator): «покажи карточку», «что у абонента X». Шаг с action=false.
 
@@ -82,11 +82,15 @@ PLANNER_PROMPT = """\
    tickets с action=true.
 7. Оператор просит показать карточку другого абонента — шаг support.
 8. Просьба изменить тариф, услугу или контакты («переведи меня на…»,
-   «подключи», «отключи», «поменяй номер») — шаг tariff с action=true.
+   «подключи», «отключи Музыку», «поменяй номер») — шаг tariff с action=true.
    Не отправляй такую просьбу в kb: агент tariff сам покажет правила
    и карточку подтверждения.
-9. Если не понятно, какое действие нужно, верни пустой steps и заполни
+9. «Позови оператора», «создай обращение», «это не работает, почините» —
+   шаг tickets с action=true.
+10. Если не понятно, какое действие нужно, верни пустой steps и заполни
    question — уточняющий вопрос абоненту.
+11. Каждая реплика абонента — новый план: история (строки «шаги плана:…»)
+   лишь контекст, а не готовый ответ.
 
 Пример. Абонент: «какой у меня тариф и почему списание 440?»
 Ответ: {"steps": [{"agent": "data", "task": "узнать тариф абонента и его списания",
@@ -106,12 +110,18 @@ def build_planner():
     return build_agent("planner", PLANNER_PROMPT, output_type=Plan)
 
 
+def _may_act(agent: str) -> bool:
+    """Действия может готовить только агент изменений или эскалации."""
+    return agent in ("tariff", "tickets")
+
+
 def gate(plan: Plan) -> tuple[Plan, list[dict]]:
     """Гейт плана: код решает, что из плана модели доходит до исполнения.
 
-    Неизвестные агенты отбрасываются; у агентов чтения пометка action
-    снимается — в контуре чтения действий нет по построению. Возвращает
-    отфильтрованный план и список отброшенных шагов (для трейса сессии).
+    Неизвестные агенты отбрасываются; пометка действия остаётся только у
+    тарифа и эскалации — у агентов чтения (data, kb, support) действий
+    нет по построению. Возвращает отфильтрованный план и список
+    отброшенных шагов (для трейса сессии).
     """
     kept: list[Step] = []
     dropped: list[dict] = []
@@ -120,7 +130,7 @@ def gate(plan: Plan) -> tuple[Plan, list[dict]]:
         if agent not in READ_AGENTS + ACTION_AGENTS:
             dropped.append({"agent": step.agent, "task": step.task, "reason": "unknown_agent"})
             continue
-        action = bool(step.action) and agent in ACTION_AGENTS
+        action = bool(step.action) and _may_act(agent)
         if step.action and not action:
             dropped.append({"agent": agent, "task": step.task, "reason": "action_in_read_agent"})
         if not step.task:
@@ -147,9 +157,9 @@ def history_message(message: str) -> dict:
 def plan_message(plan: Plan) -> dict:
     """Сводка плана в истории: следующий ход знает, что уже делали."""
     if not plan.steps:
-        return {"role": "assistant", "content": "план: шагов нет"}
+        return {"role": "assistant", "content": "запущенных специалистов: нет"}
     agents = ", ".join(f"{s.agent}{' (действие)' if s.action else ''}" for s in plan.steps)
-    return {"role": "assistant", "content": f"план: {agents}"}
+    return {"role": "assistant", "content": f"запущенные специалисты: {agents}"}
 
 
 def _json_block(text: str) -> str:
@@ -177,10 +187,12 @@ async def next_plan(planner, history: list, message: str) -> tuple[Plan, list]:
         # второй шанс: без JSON-режима сервера модель учится по инструкции
         plain = _plain_variant(planner)
         if plain is not None:
-            try:
-                plan = await _plan_once(plain, turn)
-            except Exception as e:  # noqa: BLE001
-                error = f"{error}; retry: {str(e)[:80]}" if error else str(e)[:120]
+            for context in (turn, [history_message(message)]):
+                try:
+                    plan = await _plan_once(plain, context)
+                    break
+                except Exception as e:  # noqa: BLE001
+                    error = f"{error}; retry: {str(e)[:80]}" if error else str(e)[:120]
     if plan is None:
         # редактор ответит сам, без докладов агентов
         plan = Plan(question=None, steps=[])
@@ -204,9 +216,11 @@ async def _plan_once(planner, turn: list) -> Plan:
 
 
 def _check_plan(plan: Plan) -> None:
-    """План без шагов и без вопроса — признак сбоя модели: новый шанс."""
+    """План, которого не могло быть: кривые шаги или пустота при вопросе."""
     if not plan.steps and not plan.question:
         raise ValueError("пустой план")
+    if any(not step.agent.strip() for step in plan.steps):
+        raise ValueError("шаг без агента")
 
 
 def _plain_variant(planner):

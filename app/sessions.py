@@ -31,6 +31,7 @@ class Session:
     trace_id: str = ""                           # сквозной id текущего хода
     planner: object | None = None                # собирается лениво на первом ходе
     pending_card: object | None = None           # живая карточка подтверждения
+    pep: object | None = None                    # клиент PDP (лениво, app.pep)
     session_id: str = field(default_factory=lambda: f"sess_{uuid.uuid4().hex[:8]}")
 
     def note(self, tool: str) -> None:
@@ -46,8 +47,12 @@ async def open_session(login: str) -> Session:
         raise KeyError(f"неизвестный пользователь: {login}")
 
     tokens = Tokens(login)
-    # TODO(контракты): добавить "actions" — сессия подключится к action-MCP.
-    pool = McpPool(tokens, resource_keys=("crm", "billing", "kb"))
+    # action-MCP подключается, когда у пользователя есть права на запись:
+    # у клиента только на чтение инструментов действий нет
+    resources = ["crm", "billing", "kb"]
+    if may_write(user):
+        resources.append("actions")
+    pool = McpPool(tokens, resource_keys=tuple(resources))
     await pool.connect()
 
     session = Session(login=login, user=user, tokens=tokens, pool=pool)
@@ -59,5 +64,25 @@ async def open_session(login: str) -> Session:
     return session
 
 
+def may_write(user: config.User) -> bool:
+    """Клиент с правом на тарифы может готовить действия; оператор — нет."""
+    return user.role == "client" and "tariffs:write" in user.scopes
+
+
 def get(session_id: str) -> Session | None:
     return SESSIONS.get(session_id)
+
+
+def pep_of(session: Session):
+    """PEP сессии: создаётся при первом обращении (субъект — из сессии)."""
+    from app.pep import Pep
+
+    pep = session.pep
+    if pep is None:
+        pep = Pep(session.session_id, {
+            "sub": session.user.sub,
+            "role": session.user.role,
+            "scopes": list(session.user.scopes),
+        })
+        session.pep = pep
+    return pep

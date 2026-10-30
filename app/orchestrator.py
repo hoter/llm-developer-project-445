@@ -13,9 +13,11 @@ TODO(контракты) — карточка действия:
     f"{action}:{pending_id}", idempotency.execute → вызов MCP execute_action
     → человекочитаемый ответ (executed / duplicate / daily_limit / отказ).
 
-TODO(аудит) — аудит: audit.append на все исходы пути действия
-  (executed с before/after, duplicate_suppressed, rejected_by_user,
-  server_limit, escalated).
+Аудит: на каждый ход заводится trace_id; исходы пути действия пишутся в
+audit_log (executed с before/after, duplicate_suppressed, rejected_by_user,
+rejected_by_contract, server_limit, denied, escalated, error), запуски
+агентов — в llm_calls (app.llm), вызовы инструментов моделью — в
+tool_calls (app.wrap). Хронология хода: app.audit.timeline(trace_id).
 
 TODO(права) — права: «да» → PEP: pep.confirm → pep.execute; при Deny —
   человекочитаемый отказ по reason (session_limit, confirmation_expired,
@@ -81,6 +83,13 @@ async def _turn(session, message: str, emit: Emit) -> None:
     # живая карточка: «да», «нет» и «оператор» обслуживает код, не LLM
     card = cards.active(session)
     if card is None and cards.classify_answer(message) == "yes" and len(message.split()) <= 3:
+        # повтор «да» по уже подтверждённому действию: карточка закрыта,
+        # но ключ жив — исполнение проверит идемпотентность и ответит дублем
+        previous = last_card(session)
+        if previous is not None:
+            text = await execute_pending(session, previous)
+            await emit({"type": "reply", "text": text, "sources": []})
+            return
         await emit({"type": "reply",
                     "text": "Подтверждать нечего: действие не подготовлено. "
                             "Напишите, что изменить, — покажу карточку.", "sources": []})
@@ -95,7 +104,8 @@ async def _turn(session, message: str, emit: Emit) -> None:
             cards.settle(session, card, "rejected")
             audit.append(session.user.sub, card.action, "rejected_by_user",
                          trace_id=session.trace_id, session_id=session.session_id,
-                         args=card.details, detail=f"pending {card.pending_id}")
+                         args=card.details, idempotency_key=f"{card.action}:{card.pending_id}",
+                         detail=f"карточка {card.pending_id} отменена пользователем")
             await emit({"type": "reply", "text": "Хорошо, отменяю. Ничего не менял.", "sources": []})
             return
         if answer == "operator":
@@ -134,13 +144,32 @@ async def _turn(session, message: str, emit: Emit) -> None:
     # агент подготовил карточку — ход завершается ожиданием «да/нет»
     fresh = fresh_card(session, card)
     if fresh is not None:
+        audit.append(session.user.sub, fresh.action, "awaiting_confirmation",
+                     trace_id=session.trace_id, session_id=session.session_id,
+                     args=fresh.details,
+                     detail=f"подготовлена карточка {fresh.pending_id}, ждём «да»")
         await emit({"type": "card", "pending_id": fresh.pending_id,
                     "card": fresh.public_view(config.CARD_TTL_SEC)})
         return
 
+    # агент эскалации создал обращение — в журнал, даже без карточки
+    for run in runs:
+        if run.get("agent") != "tickets":
+            continue
+        for call in run.get("tools", []):
+            output = call.get("output") or {}
+            if call.get("tool") == "create_ticket" and output.get("ticket_id"):
+                audit.append(session.user.sub, "create_ticket", "escalated",
+                             trace_id=session.trace_id, session_id=session.session_id,
+                             args={"via": "tickets"}, after={"ticket_id": output["ticket_id"]},
+                             idempotency_key=f"ticket:{output['ticket_id']}")
+
     # агент не подготовил карточку: говорим исход прямо, а не доклад агента
     blocked = refused(runs)
     if blocked is not None:
+        audit.append(session.user.sub, "action_prepare", "rejected_by_contract",
+                     trace_id=session.trace_id, session_id=session.session_id,
+                     detail=blocked[:200])
         await emit({"type": "reply", "text": blocked, "sources": []})
         return
 
@@ -183,6 +212,15 @@ def _wants_card(message: str) -> bool:
         return True
     words = set(message.lower().replace("ё", "е").split())
     return bool(words & {"да", "нет", "оператор", "подтверждаю", "отмена", "отменить"})
+
+
+def last_card(session) -> cards.Card | None:
+    """Последняя карточка сессии, исполнение которой уже подтверждено.
+
+    «Да» по ней — повтор: исполнение ведёт idempotency (ключ тот же) и
+    отвечает «уже исполнена», а не запускает действие заново.
+    """
+    return getattr(session, "confirmed_card", None)
 
 
 def fresh_card(session, before) -> cards.Card | None:
@@ -244,7 +282,8 @@ async def execute_pending(session, card: cards.Card) -> str:
         stored = await idempotency.execute(key, session.user.sub, card.action, run)
     except Exception as e:  # noqa: BLE001 — сбой исполнения: карточка живёт, ключ не занят
         audit.append(session.user.sub, card.action, "error", trace_id=session.trace_id,
-                     session_id=session.session_id, args=card.details, detail=str(e)[:200])
+                     session_id=session.session_id, args=card.details,
+                     idempotency_key=key, detail=str(e)[:200])
         return "Не удалось исполнить действие, попробуйте ответить «да» ещё раз."
 
     result = stored.result
@@ -252,6 +291,7 @@ async def execute_pending(session, card: cards.Card) -> str:
     outcome = _outcome_of(session, card, stored)
     if stored.duplicate or outcome == "duplicate":
         cards.settle(session, card, "confirmed")
+        session.confirmed_card = card
         audit.append(session.user.sub, card.action, "duplicate_suppressed",
                      trace_id=session.trace_id, session_id=session.session_id,
                      args=card.details, before=before, after=after,
@@ -260,7 +300,8 @@ async def execute_pending(session, card: cards.Card) -> str:
 
     if outcome == "executed":
         cards.settle(session, card, "confirmed")
-        audit.append(_who(session, card), card.action, "executed",
+        session.confirmed_card = card
+        audit.append(session.user.sub, card.action, "executed",
                      trace_id=session.trace_id, session_id=session.session_id,
                      args=card.details, before=before, after=after, idempotency_key=key)
         return result.get("message") or "Готово."
@@ -268,7 +309,8 @@ async def execute_pending(session, card: cards.Card) -> str:
     if outcome == "daily_limit":
         cards.settle(session, card, "denied")
         audit.append(session.user.sub, card.action, "server_limit", trace_id=session.trace_id,
-                     session_id=session.session_id, args=card.details, detail=str(result)[:200])
+                     session_id=session.session_id, args=card.details,
+                     idempotency_key=key, detail=str(result)[:200])
         limit = result.get("limit", 3)
         return (f"Пока не получилось: дневной лимит смен тарифа ({limit} за сутки) исчерпан. "
                 "Попробуйте завтра или напишите оператору.")
@@ -276,7 +318,8 @@ async def execute_pending(session, card: cards.Card) -> str:
     # прочий отказ бизнес-правила: карточка закрыта, ключ не занят
     cards.settle(session, card, "denied")
     audit.append(session.user.sub, card.action, "rejected_by_contract", trace_id=session.trace_id,
-                 session_id=session.session_id, args=card.details, detail=str(result)[:200])
+                 session_id=session.session_id, args=card.details,
+                 idempotency_key=key, detail=str(result)[:200])
     return result.get("message") or "Действие отклонено."
 
 
@@ -298,7 +341,8 @@ async def _state_of(session, card: cards.Card) -> str | None:
 
 
 def _who(session, card: cards.Card) -> str:
-    return card.sub or session.user.sub
+    """Кто действовал: субъект сессии (карточка привязана к нему же)."""
+    return session.user.sub
 
 
 async def call_action(session, tool: str, args: dict) -> dict:
@@ -325,6 +369,9 @@ async def escalate(session, message: str, card: cards.Card | None = None) -> str
     """Эскалация: обращение в поддержку без карточки (риск низкий, но в аудит)."""
     if card is not None:
         cards.settle(session, card, "rejected")
+        audit.append(session.user.sub, card.action, "rejected_by_user",
+                     trace_id=session.trace_id, session_id=session.session_id,
+                     args=card.details, detail="заменена обращением к оператору")
     subject = "Обращение из чата"
     note = message[:500]
     try:
@@ -336,8 +383,10 @@ async def escalate(session, message: str, card: cards.Card | None = None) -> str
                      session_id=session.session_id, detail=str(e)[:200])
         return "Не удалось создать обращение. Попробуйте позже."
     ticket = result.get("ticket_id", "")
+    # в журнал — факт обращения и номер, не текст реплики абонента
     audit.append(session.user.sub, "create_ticket", "escalated", trace_id=session.trace_id,
                  session_id=session.session_id,
-                 args={"subject": subject}, after={"ticket_id": ticket})
+                 args={"subject": subject}, after={"ticket_id": ticket},
+                 idempotency_key=f"ticket:{ticket}")
     return (f"Передал ваш вопрос оператору поддержки, обращение {ticket}. "
             "Ответ придёт на почту из карточки.")

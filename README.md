@@ -96,6 +96,27 @@ data: {"type": "reply", "text": "...", "sources": ["charge_rules", ...]}
 data: {"type": "done"}
 ```
 
+## Аудит и разбор инцидентов
+
+Каждый ход получает `trace_id`; ходы одного диалога связывает `session_id`.
+Три журнала в Postgres, только дописываются:
+
+| Таблица      | Что хранит                                                  |
+|--------------|-------------------------------------------------------------|
+| `audit_log`  | исходы контура: `executed` (с `before`/`after`), `duplicate_suppressed`, `rejected_by_user`, `denied`, `server_limit`, `escalated`, `error` |
+| `llm_calls`  | запуск агента: имя, модель, токены, задержка                |
+| `tool_calls` | вызов инструмента моделью: аргументы (обрезаны), исход, задержка |
+
+Текст реплик целиком не пишется — журнал про действия, не про переписку.
+
+```python
+from app import audit
+
+audit.tail(20, who="u_4f2a")        # последние записи абонента
+audit.trace("tr_1a2b3c4d5e6f")      # только audit_log одного хода
+audit.timeline("tr_1a2b3c4d5e6f")   # хронология: audit + llm_calls + tool_calls
+```
+
 ## Использование
 
 Бэкенд, action-MCP и стенд — в отдельных терминалах:
@@ -150,6 +171,7 @@ Smoke-проверки не зависят от модели и прогоняю
 make smoke G=0     # стенд, токены, read-MCP, векторный поиск по базе знаний
 make smoke G=1     # backend: сессия, видимые инструменты
 make smoke G=2     # action-MCP: контракты, ошибки, executed → duplicate
+make smoke G=3     # аудит: executed с before/after, duplicate_suppressed
 make smoke         # все доступные группы
 ```
 

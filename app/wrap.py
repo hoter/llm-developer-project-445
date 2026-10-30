@@ -23,14 +23,15 @@ TODO(права): два барьера —
 from __future__ import annotations
 
 import json
+import time
 
 from agents import FunctionTool
 from agents.run_context import RunContextWrapper
 from mcp.shared.exceptions import MCPError
 
-from app import cards
+from app import audit, cards
 from app.sessions import Session
-from core import config
+from core import config, db
 
 # Инструменты исполнения: их вызывает только код после подтверждения.
 EXECUTION_ONLY = frozenset({"execute_action"})
@@ -49,34 +50,46 @@ def wrap_mcp_tool(session: Session, name: str) -> FunctionTool:
         raise ValueError(f"{name} нельзя отдавать модели: только исполнение кодом")
 
     async def invoke(ctx: RunContextWrapper, input_json: str) -> str:
+        started = time.monotonic()
+        outcome = "ok"
         try:
-            args = json.loads(input_json) if input_json and input_json.strip() else {}
-        except (TypeError, ValueError):
-            return json.dumps(
-                {"error": "bad_arguments", "detail": "аргументы — не JSON; повтори вызов по схеме"},
-                ensure_ascii=False,
-            )
-        if not isinstance(args, dict):
-            return json.dumps({"error": "bad_arguments", "detail": "аргументы — JSON-объект"},
-                              ensure_ascii=False)
-        # субъект подставляет код оркестратора, модель его не видит в схеме
-        args.pop("sub", None)
-        if _has_subject(session, name):
-            args["sub"] = session.user.sub
-        session.note(name)
-        try:
-            result = await session.pool.call(session.pool.resource_of(name), name, args)
-        except MCPError as e:
-            data = e.data if isinstance(e.data, dict) else {}
-            return json.dumps(
-                {"error": getattr(e, "message", "tool_failed")[:60], **data},
-                ensure_ascii=False,
-            )
-        except Exception as e:  # noqa: BLE001 — сбой сервера становится данными для модели
-            return json.dumps({"error": "tool_failed", "detail": str(e)[:160]}, ensure_ascii=False)
+            try:
+                args = json.loads(input_json) if input_json and input_json.strip() else {}
+            except (TypeError, ValueError):
+                outcome = "bad_arguments"
+                return json.dumps(
+                    {"error": "bad_arguments", "detail": "аргументы — не JSON; повтори вызов по схеме"},
+                    ensure_ascii=False,
+                )
+            if not isinstance(args, dict):
+                outcome = "bad_arguments"
+                return json.dumps({"error": "bad_arguments", "detail": "аргументы — JSON-объект"},
+                                  ensure_ascii=False)
+            # субъект подставляет код оркестратора, модель его не видит в схеме
+            args.pop("sub", None)
+            if _has_subject(session, name):
+                args["sub"] = session.user.sub
+            session.note(name)
+            try:
+                result = await session.pool.call(session.pool.resource_of(name), name, args)
+            except MCPError as e:
+                outcome = getattr(e, "message", "tool_error")[:60] or "tool_error"
+                data = e.data if isinstance(e.data, dict) else {}
+                return json.dumps(
+                    {"error": getattr(e, "message", "tool_failed")[:60], **data},
+                    ensure_ascii=False,
+                )
+            except Exception as e:  # noqa: BLE001 — сбой сервера становится данными для модели
+                outcome = "tool_failed"
+                return json.dumps({"error": "tool_failed", "detail": str(e)[:160]},
+                                  ensure_ascii=False)
 
-        hook = _card_answer(session, name, result)
-        return json.dumps(hook if hook is not None else result, ensure_ascii=False)
+            hook = _card_answer(session, name, result)
+            if hook is not None:
+                outcome = "card_created"
+            return json.dumps(hook if hook is not None else result, ensure_ascii=False)
+        finally:
+            _log_call(session, name, input_json, outcome, started)
 
     return FunctionTool(
         name=name,
@@ -85,6 +98,30 @@ def wrap_mcp_tool(session: Session, name: str) -> FunctionTool:
         on_invoke_tool=invoke,
         strict_json_schema=False,
     )
+
+
+def _log_call(session: Session, name: str, raw_args: str, outcome: str,
+              started: float) -> None:
+    """Вызов инструмента моделью → tool_calls: аргументы обрезаны, без реплик."""
+    args = {"raw": (raw_args or "")[:audit.ARGS_LIMIT]}
+    try:
+        parsed = json.loads(raw_args or "{}")
+        if isinstance(parsed, dict):
+            parsed.pop("sub", None)
+            args = parsed
+    except (TypeError, ValueError):
+        pass
+    # личное не пишем: почта и телефон в аргументах маскируются
+    args = {k: ("***" if k in ("email", "phone", "note") else v) for k, v in args.items()}
+    latency = int((time.monotonic() - started) * 1000)
+    try:
+        db.execute(
+            "insert into tool_calls(trace_id, tool, args, outcome, latency_ms)"
+            " values (%s, %s, %s::jsonb, %s, %s)",
+            (session.trace_id, name, audit.as_jsonb(args), outcome, latency),
+        )
+    except Exception:  # noqa: BLE001 — журнал не должен ронять ход
+        pass
 
 
 def _has_subject(session: Session, name: str) -> bool:

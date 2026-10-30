@@ -32,6 +32,7 @@ class Session:
     planner: object | None = None                # собирается лениво на первом ходе
     pending_card: object | None = None           # живая карточка подтверждения
     pep: object | None = None                    # клиент PDP (лениво, app.pep)
+    confirmed_card: object | None = None         # карточка, исполненная в сессии
     session_id: str = field(default_factory=lambda: f"sess_{uuid.uuid4().hex[:8]}")
 
     def note(self, tool: str) -> None:

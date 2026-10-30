@@ -1,7 +1,7 @@
 """Сборка агентов на модели из .env + учёт LLM-вызовов.
 
-TODO(аудит): в run_agent — INSERT в llm_calls: trace_id, имя агента,
-  модель, токены (result.context_wrapper.usage), латентность.
+Каждый запуск агента — запись в llm_calls: trace_id, имя агента, модель,
+токены (usage запроса) и задержка вокруг запуска.
 
 TODO(failover): если llm_pool.enabled() — запуск через
   llm_pool.run_with_failover, в llm_calls — фактический провайдер.
@@ -15,7 +15,8 @@ import time
 from agents import Agent, AgentOutputSchema, ModelSettings, Runner
 from agents.items import MessageOutputItem, ToolCallItem, ToolCallOutputItem
 
-from core import config
+from app import audit
+from core import config, db
 
 
 def build_agent(name: str, instructions: str, tools=None, output_type=None) -> Agent:
@@ -132,15 +133,28 @@ def _sources_of(value) -> list[str]:
 
 
 async def run_agent(agent: Agent, task: str, *, trace_id: str = "") -> dict:
-    """Отдельный Runner.run агента → доклад, tool-вызовы и инструменты хода."""
+    """Отдельный Runner.run агента → доклад, tool-вызовы и инструменты хода.
+
+    Каждый запуск агента пишется в llm_calls: токены из usage (сумма по
+    всем запросам хода), задержка — вокруг самого запуска. Текст задачи и
+    ответа в журнал не идёт: там бывают персональные данные.
+    """
     started = time.monotonic()
-    result = await Runner.run(agent, task, max_turns=6)
+    try:
+        result = await Runner.run(agent, task, max_turns=6)
+    except Exception as e:
+        # неуспешный запуск тоже в журнале: видно, что модель не ответила
+        _log_call(agent, None, trace_id, time.monotonic() - started)
+        audit.append(getattr(agent, "name", "?"), "llm_run", "error", trace_id=trace_id,
+                     detail=repr(e)[:200])
+        raise
     seconds = time.monotonic() - started
     tools = collect_tool_runs(result)
 
     report = (result.final_output if isinstance(result.final_output, str) else "").strip()
     if not report:
         report = _final_text(result).strip()
+    _log_call(agent, result, trace_id, seconds)
     return {
         "report": report,
         "tools": tools,
@@ -148,6 +162,27 @@ async def run_agent(agent: Agent, task: str, *, trace_id: str = "") -> dict:
         "usage": _usage(result),
         "messages": _final_messages(result, report),
     }
+
+
+def _log_call(agent: Agent, result, trace_id: str, seconds: float) -> None:
+    """Запуск агента → llm_calls (модель, токены, задержка)."""
+    usage = _usage(result) if result is not None else {"input_tokens": 0, "output_tokens": 0}
+    try:
+        db.execute(
+            "insert into llm_calls(trace_id, agent, model, input_tokens, output_tokens, latency_ms)"
+            " values (%s, %s, %s, %s, %s, %s)",
+            (trace_id, getattr(agent, "name", "?"), _model_name(agent),
+             usage["input_tokens"], usage["output_tokens"], int(seconds * 1000)),
+        )
+    except Exception:  # noqa: BLE001 — журнал не должен ронять ход
+        pass
+
+
+def _model_name(agent: Agent) -> str:
+    model = getattr(agent, "model", None)
+    if isinstance(model, str):
+        return model
+    return getattr(model, "model", None) or str(model) or ""
 
 
 def _final_messages(result, final: str = "") -> list[str]:

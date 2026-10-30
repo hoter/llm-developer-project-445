@@ -1,0 +1,46 @@
+// Cedar action schema: write-путь агента мобильного оператора.
+//
+// Субъектные факты (sub, role, scopes) едут в context.input: PyO3-биндинг
+// dogwood-py не передаёт атрибуты entity, поэтому PDP собирает input сам —
+// вместе с данными вызова. pending_id карточке присваивается до запроса
+// prepare: так событие подготовки несёт идентификатор, и «да» биндится
+// политикой к конкретной карточке. Типы — закрытые записи: лишних ключей
+// в контракте нет; identity-ключи (user_id/sub/...) отлавливает guard
+// в политике (и сервис — синтезом reason).
+namespace Tel {
+    type WriteInput = {
+        action: String,       // какое действие: tariff_change | service_toggle | contacts_update
+        pending_id: String,   // идентификатор карточки подтверждения
+        details: String,      // аргументы действия — JSON-строка (для политики непрозрачны)
+        guard_ok: Bool,    // verdikt guardrail-сервиса на этом ходу (fail-closed: false)
+        sub: String,
+        role: String,
+        scopes: Set<String>
+    };
+
+    entity OAuthUser;
+    entity Gateway;
+
+    // Подготовка карточки действия (ничего не исполняет).
+    action "Prepare" appliesTo {
+        principal: [OAuthUser],
+        resource: [Gateway],
+        context: { input: WriteInput }
+    };
+
+    // Синтетическое действие: «да» пользователя по конкретной карточке.
+    // Разрешается, только если та же карточка была недавно подготовлена
+    // (см. tariff.dw); само по себе ничего не исполняет — но его событие
+    // открывает путь к Execute.
+    action "ConfirmCard" appliesTo {
+        principal: [OAuthUser],
+        resource: [Gateway],
+        context: { input: WriteInput }
+    };
+
+    action "Execute" appliesTo {
+        principal: [OAuthUser],
+        resource: [Gateway],
+        context: { input: WriteInput }
+    };
+}

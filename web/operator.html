@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Мобильный оператор — очередь оператора</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  main { display: block; padding: 20px; overflow-y: auto; }
+  table { border-collapse: collapse; width: 100%; background: var(--panel); border-radius: 10px; overflow: hidden; }
+  th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--line); font-size: 14px; }
+  th { color: var(--muted); font-size: 12px; text-transform: uppercase; }
+  .btn { margin: 0 0 14px; padding: 8px 16px; border-radius: 8px; border: 0; background: var(--accent); color: #fff; cursor: pointer; }
+</style>
+</head>
+<body>
+<header><div class="brand">＊ Mobile — очередь обращений</div>
+  <nav><a href="/">← чат</a></nav>
+</header>
+<main>
+  <button class="btn" onclick="load()">Обновить</button>
+  <table>
+    <thead><tr><th>Тикет</th><th>Абонент</th><th>Тема</th><th>Суть</th><th>Статус</th></tr></thead>
+    <tbody id="rows"><tr><td colspan="5">—</td></tr></tbody>
+  </table>
+</main>
+<script>
+const STAND = 'http://127.0.0.1:8100';
+const esc = s => String(s ?? '').replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+async function load() {
+  const r = await fetch(`${STAND}/mock/tickets`);
+  const data = await r.json();
+  document.getElementById('rows').innerHTML = (data.tickets || []).map(t => `
+    <tr><td>${t.id}</td><td>${t.sub}</td><td>${esc(t.subject)}</td>
+    <td>${esc(t.note)}</td><td>${t.status}</td></tr>`).join('') || '<tr><td colspan="5">пусто</td></tr>';
+}
+load();
+</script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+# Успешный read-сценарий: вопрос о данных — агент данных, ответ без действий.
+name: 10_read_tariff
+user: anna
+turns:
+  - say: какой у меня тариф и что входит?
+    expect:
+      plan_has: [data]
+      card: false
+      reply_contains: ["азовый"]

@@ -1,0 +1,63 @@
+# Демо-данные оператора: сидятся в Postgres командой `make seed` (core/seed.py).
+
+tariffs:
+  - name: Базовый
+    price_rub: 440
+    data_gb: 15
+    description: "минимальный набор: звонки и интернет"
+    available: true
+  - name: Игровой
+    price_rub: 590
+    data_gb: 50
+    description: "безлимит на игры до 3 часов в день"
+    available: true
+  - name: Семейный
+    price_rub: 890
+    data_gb: 100
+    description: "100 ГБ и до 5 номеров в группе"
+    available: true
+  - name: Про
+    price_rub: 350
+    data_gb: 5
+    description: "архивный тариф, недоступен для подключения"
+    available: false
+
+# Подключаемые услуги (каталог)
+service_catalog:
+  - name: Музыка
+    price_rub: 149
+  - name: Роуминг
+    price_rub: 299
+  - name: Антивирус
+    price_rub: 99
+
+subscribers:
+  - login: anna
+    sub: u_4f2a
+    name: Анна
+    phone: "+7 900 111-22-33"
+    email: anna@example.ru
+    tariff: Базовый
+    balance_rub: 1200
+    services:
+      - { name: Музыка, enabled: true }
+      - { name: Роуминг, enabled: false }
+  - login: boris
+    sub: u_9b1c
+    name: Борис
+    phone: "+7 900 444-55-66"
+    email: boris@example.ru
+    tariff: Игровой
+    balance_rub: 300
+    services:
+      - { name: Антивирус, enabled: true }
+
+charges:
+  - { sub: u_4f2a, month: "2026-08", label: "тариф Базовый", amount_rub: 440 }
+  - { sub: u_4f2a, month: "2026-09", label: "тариф Базовый", amount_rub: 440 }
+  - { sub: u_4f2a, month: "2026-09", label: "услуга Музыка", amount_rub: 149 }
+  - { sub: u_9b1c, month: "2026-09", label: "тариф Игровой", amount_rub: 590 }
+
+# Дневной лимит смен тарифа на стороне бизнес-системы (дублирует политику:
+# защита на случай скомпрометированного вызывающего)
+DAILY_TARIFF_CHANGE_LIMIT: 3

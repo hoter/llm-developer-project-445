@@ -1,0 +1,65 @@
+:root {
+  --bg: #0f1420;
+  --panel: #171e2e;
+  --line: #263149;
+  --text: #e8ecf5;
+  --muted: #93a0b8;
+  --accent: #5b8cff;
+  --ok: #37b26c;
+  --warn: #e0a13c;
+  --danger: #e05c5c;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; font: 15px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg); color: var(--text);
+  height: 100vh; display: flex; flex-direction: column;
+}
+header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 18px; border-bottom: 1px solid var(--line); background: var(--panel);
+}
+.brand { font-weight: 700; letter-spacing: .5px; }
+nav { display: flex; gap: 16px; align-items: center; color: var(--muted); }
+nav select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+nav a { color: var(--accent); text-decoration: none; }
+
+main { flex: 1; display: grid; grid-template-columns: 300px 1fr; min-height: 0; }
+#side { border-right: 1px solid var(--line); padding: 14px; overflow-y: auto; background: var(--panel); }
+.statusline { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+#session-state { color: var(--ok); }
+.hint { font-size: 12.5px; color: var(--muted); border: 1px dashed var(--line); border-radius: 8px; padding: 8px 10px; }
+#tools { margin-top: 12px; font-size: 12px; color: var(--muted); }
+#tools b { display: block; color: var(--text); margin-bottom: 4px; }
+#tools .t { padding: 2px 0; border-bottom: 1px dotted var(--line); }
+
+#chat { display: flex; flex-direction: column; min-height: 0; }
+#log { flex: 1; overflow-y: auto; padding: 18px 22px; display: flex; flex-direction: column; gap: 10px; }
+.msg { max-width: 72%; padding: 9px 13px; border-radius: 12px; white-space: pre-wrap; }
+.msg.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+.msg.bot { align-self: flex-start; background: var(--panel); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
+.msg.sys { align-self: center; color: var(--muted); font-size: 12.5px; background: none; }
+.msg.bot .src { display: block; margin-top: 6px; color: var(--muted); font-size: 12px; }
+
+.card {
+  align-self: flex-start; max-width: 76%;
+  background: var(--panel); border: 1px solid var(--warn); border-radius: 12px; padding: 12px 14px;
+}
+.card h4 { margin: 0 0 8px; color: var(--warn); font-size: 13px; text-transform: uppercase; letter-spacing: .4px; }
+.card table { border-collapse: collapse; width: 100%; margin-bottom: 10px; }
+.card td { padding: 3px 8px 3px 0; font-size: 14px; }
+.card td:first-child { color: var(--muted); }
+.card .ttl { color: var(--muted); font-size: 12px; }
+.card .btns { display: flex; gap: 8px; }
+.card button {
+  padding: 7px 16px; border-radius: 8px; border: 1px solid var(--line);
+  background: var(--bg); color: var(--text); cursor: pointer; font-size: 14px;
+}
+.card button.yes { background: var(--ok); border-color: var(--ok); color: #fff; }
+.card button:disabled { opacity: .45; cursor: default; }
+.card.done { border-color: var(--line); opacity: .75; }
+
+#form { display: flex; gap: 8px; padding: 12px 18px; border-top: 1px solid var(--line); background: var(--panel); }
+#text { flex: 1; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+#send { padding: 10px 18px; border-radius: 8px; border: 0; background: var(--accent); color: #fff; cursor: pointer; }
+#send:disabled { opacity: .4; }

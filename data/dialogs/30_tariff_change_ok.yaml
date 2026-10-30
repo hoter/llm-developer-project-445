@@ -1,0 +1,12 @@
+# Смена тарифа end-to-end: подготовка → карточка → «да» → исполнение.
+name: 30_tariff_change_ok
+user: anna
+turns:
+  - say: переведи меня на семейный
+    expect:
+      plan_has: [tariff]
+      card: true
+  - say: да
+    expect:
+      reply_contains: ["отово"]
+      state: { tariff: Семейный }

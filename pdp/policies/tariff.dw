@@ -1,0 +1,21 @@
+// Политики write-пути агента мобильного оператора (Dogwood: Cedar + temporal).
+//
+// TODO(права): написать политики «да — что да?» (схема действий — в
+// schema.cedarschema, действия Prepare / ConfirmCard / Execute):
+//
+//   1. permit Prepare — клиент с tariffs:write; guard-условия:
+//      identity-ключи (user_id/account/subscriber) в аргументах не
+//      существуют; с guardrail — ещё context.input.guard_ok.
+//   2. permit ConfirmCard — та же карточка готовилась недавно:
+//      when temporal { formerly within 1h
+//          Tel::Action::"Prepare"::request{ input.pending_id:
+//          context.input.pending_id } }.
+//   3. permit Execute — formerly within 1h ConfirmCard той же карточки.
+//   4. forbid-лимит — не более двух смен тарифа за окно сессии:
+//      count_within(24h, Execute::request{ input.action:
+//      "tariff_change" }) > 2.
+//
+// Семантика Cedar: deny by default, forbid перекрывает permit.
+// Пустая политика валидна: PDP стартует и всё запрещает (deny by
+// default) — начинайте с permit Prepare и смотрите reason'ы в
+// policy_events.

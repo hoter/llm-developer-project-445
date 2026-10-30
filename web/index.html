@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Мобильный оператор — чат поддержки</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">＊ Mobile</div>
+  <nav>
+    <label>Пользователь:
+      <select id="user">
+        <option value="anna">Анна (клиент, есть право смены)</option>
+        <option value="boris">Борис (клиент, только чтение)</option>
+        <option value="olga">Ольга (оператор)</option>
+      </select>
+    </label>
+    <a href="/operator.html" target="_blank">Страница оператора</a>
+  </nav>
+</header>
+
+<main>
+  <aside id="side">
+    <div class="statusline">
+      <span id="session-state">сессия не открыта</span>
+      <span id="session-sub"></span>
+    </div>
+    <div class="hint">
+      Спросите: «какой у меня тариф», «почему списание 440»,
+      «переведи меня на Семейный», «отключи Музыку», «позови оператора».
+    </div>
+    <div id="tools"></div>
+  </aside>
+
+  <section id="chat">
+    <div id="log"></div>
+    <form id="form" autocomplete="off">
+      <input id="text" placeholder="Сообщение…" disabled>
+      <button id="send" type="submit" disabled>Отправить</button>
+    </form>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

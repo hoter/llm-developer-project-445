@@ -1,21 +1,70 @@
 // Политики write-пути агента мобильного оператора (Dogwood: Cedar + temporal).
 //
-// TODO(права): написать политики «да — что да?» (схема действий — в
-// schema.cedarschema, действия Prepare / ConfirmCard / Execute):
+// Цикл «да — что да?» из трёх действий; схема действий — в
+// schema.cedarschema. Семантика Cedar: deny by default, forbid перекрывает
+// permit. Оператору (role != "client") смена тарифа запрещена отсутствием
+// подходящего permit — отдельное forbid для него не нужно.
 //
-//   1. permit Prepare — клиент с tariffs:write; guard-условия:
-//      identity-ключи (user_id/account/subscriber) в аргументах не
-//      существуют; с guardrail — ещё context.input.guard_ok.
-//   2. permit ConfirmCard — та же карточка готовилась недавно:
-//      when temporal { formerly within 1h
-//          Tel::Action::"Prepare"::request{ input.pending_id:
-//          context.input.pending_id } }.
-//   3. permit Execute — formerly within 1h ConfirmCard той же карточки.
-//   4. forbid-лимит — не более двух смен тарифа за окно сессии:
-//      count_within(24h, Execute::request{ input.action:
-//      "tariff_change" }) > 2.
-//
-// Семантика Cedar: deny by default, forbid перекрывает permit.
-// Пустая политика валидна: PDP стартует и всё запрещает (deny by
-// default) — начинайте с permit Prepare и смотрите reason'ы в
-// policy_events.
+// Субъектные факты (role, scopes, guard_ok) едут в context.input: биндинг
+// Dogwood не передаёт атрибуты entity, PDP собирает input сам вместе с
+// данными вызова. pending_id карточке присваивается до запроса prepare —
+// так событие подготовки несёт идентификатор, и «да» биндится политикой
+// ровно к этой карточке.
+
+// 1. Prepare — подготовка карточки (ничего не исполняет).
+//    Клиент с правом записи и verdikt guardrail «ок». Ключи идентичности
+//    в аргументах не допускаются: у схемы действия их нет (закрытая
+//    запись WriteInput), а второй барьер PEP отбивает их до политики.
+permit (
+    principal,
+    action == Tel::Action::"Prepare",
+    resource
+)
+when {
+    context.input.role == "client" &&
+    context.input.scopes.contains("tariffs:write") &&
+    context.input.guard_ok == true
+};
+
+// 2. ConfirmCard — «да» абонента по конкретной карточке: разрешено, только
+//    если та же карточка (тот же pending_id) готовилась недавно — formerly
+//    Prepare. Событие «да» пишется в историю политики и открывает Execute.
+//    TTL карточки по настенным часам проверяет сам PDP.
+permit (
+    principal,
+    action == Tel::Action::"ConfirmCard",
+    resource
+)
+when temporal {
+    formerly within 1h Tel::Action::"Prepare"::request{
+        input.pending_id: context.input.pending_id
+    }
+};
+
+// 3. Execute — исполнение разрешено только после «да» по той же карточке:
+//    formerly ConfirmCard того же pending_id.
+permit (
+    principal,
+    action == Tel::Action::"Execute",
+    resource
+)
+when temporal {
+    formerly within 1h Tel::Action::"ConfirmCard"::request{
+        input.pending_id: context.input.pending_id
+    }
+};
+
+// 4. Лимит: не более двух исполнений смены тарифа за окно сессии. Считаем
+//    только действие tariff_change — услуги и контакты лимит не расходуют.
+//    forbid перекрывает permit, поэтому третья смена не пройдёт, даже если
+//    предыдущие правила разрешают.
+forbid (
+    principal,
+    action == Tel::Action::"Execute",
+    resource
+)
+when temporal {
+    count_within(24h, Tel::Action::"Execute"::request{
+        input.action: "tariff_change"
+    }) > 2
+};

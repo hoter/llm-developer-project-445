@@ -195,9 +195,18 @@ def refused(runs: list[dict]) -> str | None:
     }
     for run in runs:
         for call in run.get("tools", []):
-            error = (call.get("output") or {}).get("error")
+            output = call.get("output") if isinstance(call.get("output"), dict) else {}
+            error = output.get("error")
             if error in messages:
                 return messages[error]
+        # prepare_* прошёл проверки, но политика прав отказала подготовке
+        if run.get("agent") == "tariff" and not any(
+                call.get("tool", "").startswith("prepare_") and
+                (call.get("output") or {}).get("card_created") for call in run.get("tools", [])):
+            for call in run.get("tools", []):
+                output = call.get("output") or {}
+                if output.get("error") == "denied":
+                    return _deny_text(output.get("reason") or "")
     return None
 
 
@@ -258,14 +267,17 @@ async def execute_pending(session, card: cards.Card) -> str:
     Ключ f"{action}:{pending_id}" — одно «да» — одна операция; повтор
     получает сохранённый результат. Неудачный исход ключ не занимает.
     """
-    # PEP: политики шага прав; пока их нет («нет политик»), а также при
-    # недоступном PDP карточку обслуживает оркестратор — как без прав
+    # PEP: «да» → ConfirmCard → Execute. Решает политика; Deny (включая
+    # недоступный PDP) закрывает карточку и не доходит до исполнения.
     pep = pep_of(session)
-    for check in (pep.prepare, pep.confirm, pep.execute):
-        decision = await check(card)
-        if not decision.allowed and decision.by_policy:
-            await _deny_card(session, card, decision.reason)
-            return _deny_text(decision.reason)
+    confirm = await pep.confirm(card)
+    if confirm.allowed:
+        execute = await pep.execute(card)
+    else:
+        execute = confirm
+    if not execute.allowed:
+        await _deny_card(session, card, execute.reason)
+        return _deny_text(execute.reason)
 
     before = await _state_of(session, card)
     key = f"{card.action}:{card.pending_id}"
@@ -363,9 +375,15 @@ async def _deny_card(session, card: cards.Card, reason: str) -> None:
 
 def _deny_text(reason: str) -> str:
     texts = {
-        "confirmation_expired": "Карточка устарела — подготовьте действие заново.",
-        "session_limit": "Достигнут лимит смен тарифа в этой сессии.",
+        "confirmation_expired": "Карточка устарела — повторите запрос, и я подготовлю её заново.",
+        "session_limit": ("Пока не получилось: в этой сессии уже две смены тарифа, "
+                          "а больше политика не разрешает. Напишите оператору, "
+                          "если нужно поменять ещё раз."),
+        "confirmation_missing": "Действие не было подтверждено — подготовьте карточку заново.",
+        "card_not_prepared": "Карточка не подготовлена — повторите запрос.",
         "pdp_unavailable": "Сервис прав недоступен: действия сейчас закрыты, попробуйте позже.",
+        "no_write_scope": "Изменения тарифа недоступны: у аккаунта нет права записи.",
+        "role_has_no_write": "У вашей роли нет прав на изменения — обратитесь к оператору.",
     }
     return texts.get(reason, "Действие запрещено: проверка прав не пройдена.")
 

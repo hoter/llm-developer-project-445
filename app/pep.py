@@ -1,27 +1,22 @@
 """PEP: оркестратор спрашивает PDP — сам решений о write-пути не принимает.
 
-Пока политики шага прав не написаны, PDP существует, но ничего не
-разрешает и не пишет в журнал решений. Такой ответ («PDP жив, политик
-на это действие нет») — не отказ прав: оркестратор обслуживает карточку
-сам, как на шаге контрактов. Отказ прав — это Deny с причиной или
-недоступный PDP (fail-closed, action "pdp_unavailable"): тогда действие
-закрыто.
+Цикл карточки спрашивает сервис решений трижды:
 
-TODO(права): политики и полный цикл —
-  1. Decision(allowed, reason) и Pep(session_id, claims, guard_state):
-     субъектные факты из проверенного токена — sub, role,
-     scopes = claims["scope"].split().
-  2. _open(): POST {PDP_URL}/session {"session_id", "subject"} — один раз.
-  3. prepare(card) → POST /authorize {action: "Prepare"} — Allow фиксирует
-     карточку в журнале PDP; Deny — карточки не существует.
-  4. confirm(card) → POST /confirm {action: "ConfirmCard"} — «да»;
-     TTL карточки проверяет PDP по wall clock.
-  5. execute(card) → POST /authorize {action: "Execute"} — окно
-     formerly ConfirmCard + forbid-лимит.
-  6. input для политики: {"action": card.action, "pending_id",
-     "details": json.dumps(card.details), "guard_ok": bool(guard_state),
-     **subject}. Недоступный PDP — fail-closed: Decision(False,
-     "pdp_unavailable").
+  prepare(card) → POST /authorize {action: "Prepare"}   — Allow фиксирует
+                  карточку (pending_id) в журнале PDP; Deny — карточки нет;
+  confirm(card) → POST /confirm {action: "ConfirmCard"} — «да» по той же
+                  карточке (formerly Prepare); TTL карточки проверяет PDP
+                  по настенным часам;
+  execute(card) → POST /authorize {action: "Execute"}   — окно formerly
+                  ConfirmCard + forbid-лимит смен тарифа.
+
+Субъектные факты (sub, role, scopes) — из проверенных claims токена.
+Недоступный PDP — fail-closed: Decision(False, "pdp_unavailable"), действие
+закрыто, абонент получает понятный отказ.
+
+В input для политики: action, pending_id, details (JSON-строка, для политики
+непрозрачна), guard_ok (verdikt guardrail; в этом контуре его нет — true)
+и субъект.
 """
 from __future__ import annotations
 
@@ -35,34 +30,26 @@ except ImportError:  # pragma: no cover
 
 from core import config
 
-# action в policy_events, который ставит PEP, когда PDP отключён
+# reason, который PEP ставит, когда сам сервис решений недоступен
 PDP_DOWN = "pdp_unavailable"
-# так PDP (шаг прав) называет Prepare такому действию, если политик ещё нет
-NO_POLICY = "no_policy"
 
 
 @dataclass
 class Decision:
     allowed: bool
     reason: str = ""
-    # True — решение пришло от политики (включая Deny); False — политик нет
-    by_policy: bool = False
 
     def __bool__(self) -> bool:
         return self.allowed
 
 
-# Причины Deny, которые означают «политики на это действие ещё нет»
-# (их ставит deny by default в PDP без политик шага прав)
-NO_POLICY_REASONS = frozenset({"no_policy", "no_applicable_policy", "deny_by_default"})
-
-
 class Pep:
     """Клиент PDP на одну сессию чата."""
 
-    def __init__(self, session_id: str, subject: dict) -> None:
+    def __init__(self, session_id: str, subject: dict, guard_state: dict | None = None) -> None:
         self.session_id = session_id
-        self.subject = subject
+        self.subject = {k: subject[k] for k in ("sub", "role", "scopes") if k in subject}
+        self.guard_state = guard_state if guard_state is not None else {}
         self._opened = False
 
     @property
@@ -78,57 +65,36 @@ class Pep:
     async def _open(self) -> None:
         if self._opened:
             return
-        try:
-            await self._post("/session", {"session_id": self.session_id, "subject": self.subject})
-            self._opened = True
-        except Exception:  # noqa: BLE001 — PDP не принимает сессию: политик нет
-            pass
+        await self._post("/session", {"session_id": self.session_id, "subject": self.subject})
+        self._opened = True
 
     def _input(self, card) -> dict:
         return {
             "action": card.action,
             "pending_id": card.pending_id,
             "details": json.dumps(card.details, ensure_ascii=False),
-            "guard_ok": True,
+            "guard_ok": bool(self.guard_state.get("ok", True)),
             **self.subject,
         }
 
-    async def _decision(self, body: dict) -> Decision:
-        decision = str(body.get("decision", "")).lower()
-        reason = body.get("reason") or ""
-        if decision != "allow" and reason == PDP_DOWN:
-            return Decision(False, PDP_DOWN, by_policy=True)
-        if reason in NO_POLICY_REASONS:
-            # PDP жив, но политики на действие ещё нет (шаг прав):
-            # карточку обслуживает оркестратор, как без прав
-            return Decision(True, "", by_policy=False)
-        return Decision(decision == "allow",
-                        reason or ("allowed" if decision == "allow" else "denied"),
-                        by_policy=True)
-
-    async def _call(self, path: str, action: str | None, card) -> Decision:
+    async def _ask(self, path: str, action: str | None, card) -> Decision:
         payload = {"session_id": self.session_id, "input": self._input(card)}
         if action is not None:
             payload["action"] = action
         try:
             await self._open()
             body = await self._post(path, payload)
-        except Exception:  # noqa: BLE001 — PDP недоступен: политик нет
-            return Decision(False, PDP_DOWN, by_policy=False)
-        return await self._decision(body)
+        except Exception:  # noqa: BLE001 — PDP недоступен: действия закрыты
+            return Decision(False, PDP_DOWN)
+        return Decision(str(body.get("decision", "")).lower() == "allow",
+                        body.get("reason") or "")
 
     async def prepare(self, card) -> Decision:
-        return await self._call("/authorize", "Prepare", card)
+        return await self._ask("/authorize", "Prepare", card)
 
     async def confirm(self, card) -> Decision:
-        # «да» по карточке: тело {session_id, input}; действие — ConfirmCard
-        payload = {"session_id": self.session_id, "action": "ConfirmCard", "input": self._input(card)}
-        try:
-            await self._open()
-            body = await self._post("/confirm", payload)
-        except Exception:  # noqa: BLE001
-            return Decision(False, PDP_DOWN, by_policy=False)
-        return await self._decision(body)
+        # «да»: PDP сам добавляет action=ConfirmCard в input
+        return await self._ask("/confirm", None, card)
 
     async def execute(self, card) -> Decision:
-        return await self._call("/authorize", "Execute", card)
+        return await self._ask("/authorize", "Execute", card)

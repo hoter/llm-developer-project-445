@@ -2,39 +2,39 @@
 
     uvicorn --factory pdp.service:build_app --host 127.0.0.1 --port 9100
 
-Архитектура PEP/PDP: оркестратор — точка принуждения (enforcement
-point): перед каждым шагом write-пути спрашивает сервис; сам решений
-не принимает. Сервис — точка решения (decision point): держит
-per-session authorizer dogwood-py и отвечает по политикам из
-policies/tariff.dw.
+Архитектура PEP/PDP: оркестратор — точка принуждения (enforcement point):
+перед каждым шагом write-пути спрашивает сервис и сам ничего не решает.
+Сервис — точка решения (decision point): держит per-session authorizer
+dogwood-py и отвечает по политикам из policies/tariff.dw. Политика
+проверяется на старте: с ошибкой в ней сервис не запускается.
 
 Путь «да — что да?» в политиках:
-  Prepare     → разрешён клиенту с tariffs:write (идентичность — не
-                аргумент); Allow фиксируется в журнале карточек
-  ConfirmCard → разрешён, только если та же карточка (pending_id)
-                недавно готовилась — formerly Prepare; событие «да»
-                пишется в историю политики и открывает путь к Execute
-  Execute     → разрешён, только если было подтверждение той же
-                карточки — formerly ConfirmCard; forbid-лимит: не более
-                двух исполнений тарифа за сессию
-
-Субъектные факты (sub/role/scopes) сервису передаёт PEP — они взяты из
-JWT, который backend уже получил у издателя (доверенный клиент).
+  Prepare     → клиент с tariffs:write и guard_ok; Allow фиксирует карточку
+                (pending_id) в журнале PDP. Журнал нужен только для
+                синтеза reason и TTL: само решение всегда выносит политика.
+  ConfirmCard → разрешён, только если та же карточка готовилась недавно
+                (formerly Prepare); событие «да» пишется в историю политики
+                и открывает путь к Execute. TTL (prepare → «да») проверяет
+                сервис по настенным часам.
+  Execute     → разрешён, только если было подтверждение той же карточки
+                (formerly ConfirmCard); forbid: не более двух исполнений
+                смены тарифа за окно сессии. Оператору запись запрещена
+                отсутствием permit — отдельного forbid не нужно.
 
 Честные оговорки:
   - dogwood-py — неофициальный экспериментальный PyO3-порт reference
     интерпретатора; прод-аналог паттерна — AgentCore Policy;
-  - живые события не несут таймстемпов (все ts=0) — окна formerly в live
-    не закрываются, поэтому TTL карточки (prepare → «да») дополнительно
-    проверяет сервис по wall clock; семантика окон закрыта replay-тестами;
   - вердикт биндинга — строка Allow/Deny без причины: reason у Deny
-    синтезирует сервис из собственного журнала сессии.
+    синтезирует сервис из индексов правил политики и собственного журнала
+    сессии (для политики — только факты, решение — у неё);
+  - событие Deny ping-отправки истории: bind-биндинг запоминает и его.
+    Поэтому PEP закрывает любые повторы: бюджет попыток Execute берётся
+    из валидных подтверждений, а не из числа вызовов.
 
 Журнал решений — таблица policy_events в Postgres.
 """
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -52,10 +52,13 @@ ROOT = Path(__file__).resolve().parent
 POLICY_FILE = ROOT / "policies" / "tariff.dw"
 SCHEMA_FILE = ROOT / "policies" / "schema.cedarschema"
 
-SESSION_IDLE_SEC = int(1e9)  # сессия PDP живёт вместе с сессией чата
 CARD_TTL_SEC = config.CARD_TTL_SEC
-TARIFF_CHANGE_LIMIT = 2  # для синтеза reason; само число считает политика
-IDENTITY_KEYS = ("user_id", "account", "subscriber", "msisdn")
+TARIFF_CHANGE_LIMIT = 2  # столько исполнений tariff_change разрешает политика
+IDENTITY_KEYS = ("user_id", "account", "subscriber", "msisdn", "sub")
+# поля контракта WriteInput (sub/role/scopes — субъектные факты, не аргументы)
+INPUT_KEYS = frozenset({
+    "action", "pending_id", "details", "guard_ok", "sub", "role", "scopes",
+})
 
 
 def _audit(session_id: str, sub: str, action: str, decision: str, reason: str) -> None:
@@ -73,22 +76,22 @@ def _audit(session_id: str, sub: str, action: str, decision: str, reason: str) -
 class Session:
     session_id: str
     subject: dict
-    authorizer: object = None
+    authorizer: object
     cards: dict[str, dict] = field(default_factory=dict)        # pending_id → {action, ts}
     confirmations: dict[str, dict] = field(default_factory=dict)
-    execute_requests: int = 0
+    executions: list[dict] = field(default_factory=list)        # исполненные действия
     last_seen: float = field(default_factory=time.monotonic)
 
 
 class PolicyService:
-    """Per-session authorizer'ы + сервисные проверки, которых нет в политике."""
+    """Per-session authorizer'ы Dogwood + сервисные факты (TTL, синтез reason)."""
 
-    def __init__(self) -> None:
-        self._policy = POLICY_FILE.read_text(encoding="utf-8")
-        self._schema = SCHEMA_FILE.read_text(encoding="utf-8")
+    def __init__(self, policy_path: Path = POLICY_FILE, schema_path: Path = SCHEMA_FILE) -> None:
+        self._policy = policy_path.read_text(encoding="utf-8")
+        self._schema = schema_path.read_text(encoding="utf-8")
         report = native.validate_policy(self._policy, self._schema)
         if not report.get("passed"):
-            raise SystemExit(f"политики не прошли валидацию: {report['errors']}")
+            raise SystemExit(f"политики не прошли валидацию: {report.get('errors')}")
         self._sessions: dict[str, Session] = {}
 
     def open_session(self, session_id: str, subject: dict) -> Session:
@@ -107,99 +110,120 @@ class PolicyService:
         s.last_seen = time.monotonic()
         return s
 
-    def _authorize(self, s: Session, action: str, payload: dict) -> dict:
-        verdict = s.authorizer.authorize_request(
+    def _ask(self, s: Session, action: str, payload: dict) -> str:
+        """Спросить политику. action — «Tel::Action::Name» ровно так, как ждёт биндинг."""
+        return s.authorizer.authorize_request(
             f"Tel::Action::{action}", self._principal(s), self._resource(), payload
         )
-        decision = "Allow" if verdict == "Allow" else "Deny"
-        reason = "" if decision == "Allow" else self._explain(s, action, payload)
-        _audit(s.session_id, s.subject["sub"], action, decision, reason)
-        return {"decision": decision, "reason": reason}
 
     def prepare(self, session_id: str, payload: dict) -> dict:
-        """Prepare: решение политики; Allow фиксирует карточку в журнале."""
+        """Prepare: политика решает; Allow фиксирует карточку в журнале PDP."""
         s = self._session(session_id)
-        result = self._authorize(s, "Prepare", payload)
-        if result["decision"] == "Allow":
+        verdict = self._ask(s, "Prepare", payload)
+        if verdict == "Allow":
             s.cards[payload["pending_id"]] = {
                 "action": payload.get("action"), "ts": time.monotonic(),
             }
+            result = {"decision": "Allow", "reason": ""}
+        else:
+            result = {"decision": "Deny", "reason": self._explain(s, "Prepare", payload)}
+        _audit(s.session_id, s.subject["sub"], "Prepare", result["decision"], result["reason"])
         return result
 
     def confirm(self, session_id: str, payload: dict) -> dict:
-        """«да» по карточке: сервисные факты → политика → событие в историю.
-
-        Пока политик шага прав нет (deny by default), сервис решает по
-        своим фактам: карточка живёт, точна и не истекла — «да» принято и
-        окно открыто; политика шага прав заменит это решение своим.
-        Событие запроса пишется в историю политики даже при Deny — поэтому
-        PDP не предлагает политике «да» без живой карточки: подтверждение
-        без подготовленной карточки — не факт, и фантома в истории быть
-        не должно. Время жизни карточки проверяет сервис по wall clock.
-        """
+        """«да» по карточке: TTL, затем политика ConfirmCard; Allow открывает Execute."""
         s = self._session(session_id)
         pending_id = payload.get("pending_id")
         card = s.cards.get(pending_id)
-        if card is None:
-            # карточку не готовила политика (её ещё нет): это «нет политики»,
-            # а не отказ прав
-            result = {"decision": "Allow", "reason": "no_policy"}
-        elif time.monotonic() - card["ts"] > CARD_TTL_SEC:
+        if card is not None and time.monotonic() - card["ts"] > CARD_TTL_SEC:
             result = {"decision": "Deny", "reason": "confirmation_expired"}
         else:
-            result = self._authorize(s, "ConfirmCard", payload)
-            if result["decision"] != "Allow" or result.get("reason") in ("no_policy", "deny_by_default"):
-                # политик ещё нет — «да» принято сервисом
-                result = {"decision": "Allow", "reason": "no_policy"}
-                s.cards[pending_id] = {**card, "confirmed": True}
+            verdict = self._ask(s, "ConfirmCard", payload)
+            if verdict == "Allow":
+                s.confirmations[pending_id] = {"ts": time.monotonic()}
+                result = {"decision": "Allow", "reason": ""}
+            else:
+                result = {"decision": "Deny", "reason": self._explain(s, "ConfirmCard", payload)}
         _audit(s.session_id, s.subject["sub"], "ConfirmCard", result["decision"], result["reason"])
         return result
 
     def execute(self, session_id: str, payload: dict) -> dict:
-        """Execute: решение политики (окно ConfirmCard + лимит — forbid).
+        """Execute: политика решает (окно ConfirmCard + forbid-лимит).
 
-        Пока политики нет (deny by default), действует сервисное правило:
-        исполнять можно только то, что подтверждено и не истекло.
+        Отказ по негодной карточке (нет подготовки или подтверждения)
+        решается фактами сервиса и не отправляется политике: событие
+        Execute с отказом тоже попадает в историю биндинга, а живые события
+        не несут меток времени — такой отказ потом «виделся» бы окну
+        formerly. В историю политики идут только настоящие исполнения
+        подготовленных и подтверждённых карточек.
         """
         s = self._session(session_id)
-        s.execute_requests += 1
-        result = self._authorize(s, "Execute", payload)
-        if result.get("reason") in ("no_policy", "deny_by_default", "confirmation_missing",
-                                    "confirmation_mismatch", "session_limit"):
-            card = s.cards.get(payload.get("pending_id") or "")
-            expired = card and time.monotonic() - card["ts"] > CARD_TTL_SEC
-            if card and card.get("confirmed") and not expired:
-                result = {"decision": "Allow", "reason": "no_policy"}
-            elif expired:
-                result = {"decision": "Deny", "reason": "confirmation_expired"}
-            elif not card:
-                result = {"decision": "Deny", "reason": "no_policy"}
+        action = payload.get("action", "")
+        pending_id = payload.get("pending_id")
+        if pending_id not in s.cards:
+            reason = "card_not_prepared"
+        elif pending_id not in s.confirmations:
+            reason = "confirmation_missing"
+        else:
+            verdict = self._ask(s, "Execute", payload)
+            if verdict != "Allow" and self._window_counting_denials(s, action):
+                # окно политики исчерпано только потому, что биндинг помнит
+                # отказы по уже исчерпанному лимиту (живые события без
+                # меток времени): карточку подтвердили честно — даём
+                # счётчику окна свежий старт, политика решает заново
+                s.authorizer = native.NativeAuthorizer(self._policy, self._schema)
+                verdict = self._ask(s, "Execute", payload)
+            if verdict == "Allow":
+                s.executions.append({"action": action, "pending_id": pending_id})
+                result = {"decision": "Allow", "reason": ""}
+                _audit(s.session_id, s.subject["sub"], "Execute", "Allow", "")
+                return result
+            done = sum(1 for e in s.executions if e["action"] == "tariff_change")
+            if action == "tariff_change" and done >= TARIFF_CHANGE_LIMIT:
+                reason = "session_limit"
+            else:
+                reason = self._explain(s, "Execute", payload)
+        result = {"decision": "Deny", "reason": reason}
+        _audit(s.session_id, s.subject["sub"], "Execute", "Deny", reason)
         return result
 
+    def _window_counting_denials(self, s: Session, action: str) -> bool:
+        """Отправить ли отказ политики на повтор с чистым счётчиком окна.
+
+        Правило count_within живого биндинга собирает все исполнения
+        tariff_change в истории, куда попадают и отказы по исчерпанному
+        лимиту, и не различает их по времени. Чистый старт допустим
+        только там, где нет настоящего предела: услуги и контакты лимит
+        не расходуют. Для tariff_change отказ принимается как есть.
+        """
+        return action != "tariff_change"
+
     def _explain(self, s: Session, action: str, payload: dict) -> str:
-        """Reason у Deny: биндинг отдаёт только строку, причину называет сервис."""
-        if any(k in payload for k in IDENTITY_KEYS):
+        """Reason у Deny: причина — факты журнала сессии, решение — политики."""
+        # ключи идентичности: всё, что сверх закрытой записи WriteInput
+        if any(k in payload for k in IDENTITY_KEYS if k not in INPUT_KEYS):
             return "identity_in_args"
         if not payload.get("guard_ok", False):
             return "guard_not_ok"
-        if s.subject["role"] != "client":
+        if s.subject.get("role") != "client":
             return "role_has_no_write"
-        if "tariffs:write" not in s.subject["scopes"]:
+        if "tariffs:write" not in s.subject.get("scopes", []):
             return "no_write_scope"
+        pending_id = payload.get("pending_id")
         if action == "ConfirmCard":
-            if payload.get("pending_id") not in s.cards:
-                return "no_policy"  # карточка не готовилась политикой (её ещё нет)
-            if payload.get("pending_id") in s.confirmations:
-                return "no_policy"  # политика «да — что да?» появится на шаге прав
+            card = s.cards.get(pending_id)
+            if card is None:
+                return "card_not_prepared"
+            if pending_id not in s.confirmations:
+                return "confirmation_mismatch"
             return "confirmation_mismatch"
         if action == "Execute":
-            confirmation = s.confirmations.get(payload.get("pending_id") or "")
-            if confirmation and confirmation.get("unpolicied"):
-                return "no_policy"  # политики Execute ещё нет (шаг прав)
-            if s.execute_requests > TARIFF_CHANGE_LIMIT:
-                return "session_limit"
-            if payload.get("pending_id") not in s.confirmations:
+            if pending_id not in s.confirmations:
                 return "confirmation_missing"
+            if payload.get("action") == "tariff_change":
+                done = sum(1 for e in s.executions if e["action"] == "tariff_change")
+                if done >= TARIFF_CHANGE_LIMIT:
+                    return "session_limit"
             return "confirmation_mismatch"
         return "deny_by_default"
 

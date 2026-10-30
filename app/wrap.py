@@ -29,7 +29,7 @@ from agents.run_context import RunContextWrapper
 from mcp.shared.exceptions import MCPError
 
 from app import audit, cards, permissions
-from app.sessions import Session
+from app.sessions import Session, pep_of
 from core import config, db
 
 # Инструменты исполнения: их вызывает только код после подтверждения.
@@ -89,8 +89,13 @@ def wrap_mcp_tool(session: Session, name: str) -> FunctionTool:
                 return json.dumps({"error": "tool_failed", "detail": str(e)[:160]},
                                   ensure_ascii=False)
 
-            hook = _card_answer(session, name, result)
-            if hook is not None:
+            hook = await _card_answer(session, name, result)
+            if hook is None:
+                pass
+            elif hook.get("error"):
+                outcome = "prepare_denied"
+                return json.dumps(hook, ensure_ascii=False)
+            else:
                 outcome = "card_created"
             return json.dumps(hook if hook is not None else result, ensure_ascii=False)
         finally:
@@ -146,12 +151,22 @@ def _public_schema(schema: dict) -> dict:
     return schema
 
 
-def _card_answer(session: Session, name: str, result: dict) -> dict | None:
-    """Успешный prepare_* → карточка подтверждения и ответ модели."""
+async def _card_answer(session: Session, name: str, result: dict) -> dict | None:
+    """Успешный prepare_* → карточка подтверждения, если её разрешил PDP.
+
+    Карточка создаётся с pending_id заранее и проводится через Prepare:
+    так событие подготовки в политике несёт идентификатор. Deny — живой
+    карточки нет, модель получает отказ с причиной.
+    """
     action = PREPARE_ACTIONS.get(name)
     if action is None or not isinstance(result, dict) or result.get("error"):
         return None
     card = cards.create(session, action, result.get("details") or {}, result.get("view") or {})
+    decision = await pep_of(session).prepare(card)
+    if not decision.allowed:
+        cards.settle(session, card, "denied")
+        return {"error": "denied", "reason": decision.reason,
+                "detail": "подготовка действия запрещена политикой прав"}
     public = card.public_view(config.CARD_TTL_SEC)
     return {
         "card_created": True,

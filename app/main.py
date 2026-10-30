@@ -8,19 +8,133 @@
 
 События SSE хода: plan / card / reply / error / done.
 
-TODO(агенты):
-  1. lifespan: подключить LLM (config.setup_model(); в бонусе failover —
-     llm_pool.setup_pool(), если задан LLM_SECONDARY_BASE_URL).
-  2. CORS: allow_origins=["*"] — фронтенд живёт на другом порту стенда.
-  3. GET /api/health.
-  4. POST /api/session: sessions.open_session(login); ответ: session_id,
-     name, role, visible_tools — инструменты allowlist сессии
-     (с правами — permissions.visible_tools(...), до них — весь пул).
-  5. POST /api/chat: события хода через asyncio.Queue гонятся
-     StreamingResponse'ом (media_type="text/event-stream", формат
-     'data: {json}\\n\\n'); сбой хода — событие error, не падение потока.
-
 TODO(контракты): POST /api/cards/{pending_id}/decision — кнопка карточки:
   «да» → orchestrator.execute_pending, «нет» → отмена.
 """
 from __future__ import annotations
+
+import asyncio
+import json
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.requests import Request
+
+from app import orchestrator, planner
+from app.sessions import open_session
+from core import config
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    config.setup_model()
+    yield
+
+
+app = FastAPI(title="AI-оператор мобильного оператора", lifespan=lifespan)
+
+# фронтенд живёт на другом порту стенда (:8100)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+async def _json_body(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — кривое тело → пустой объект
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _visible_tools(session) -> list[str]:
+    names = set(session.pool.tool_names())
+    return [n for n in sorted(names) if session.pool.resource_of(n) != "actions"]
+
+
+@app.get("/api/health")
+async def health() -> JSONResponse:
+    return JSONResponse({"status": "ok", "service": "api"})
+
+
+@app.post("/api/session")
+async def create_session(request: Request) -> JSONResponse:
+    body = await _json_body(request)
+    login = str(body.get("user", "")).strip()
+    try:
+        session = await open_session(login)
+    except KeyError:
+        return JSONResponse({"error": "unknown_user", "detail": login}, status_code=400)
+    except Exception as e:  # noqa: BLE001 — стенд недоступен: сессия не открывается
+        return JSONResponse({"error": "stand_unavailable", "detail": str(e)[:160]}, status_code=503)
+
+    if session.planner is None:
+        # планировщик собирается на первом ходе: сборка локальная, без модели
+        session.planner = planner.build_planner()
+
+    return JSONResponse({
+        "session_id": session.session_id,
+        "name": session.user.name,
+        "role": session.user.role,
+        "visible_tools": _visible_tools(session),
+    })
+
+
+def _sse(event: dict) -> bytes:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+@app.post("/api/chat")
+async def chat(request: Request) -> StreamingResponse:
+    body = await _json_body(request)
+    session_id = str(body.get("session_id", ""))
+    message = str(body.get("message", "")).strip()
+
+    async def stream():
+        try:
+            from app.sessions import get
+
+            session = get(session_id)
+            if session is None:
+                yield _sse({"type": "error", "detail": "сессия не найдена: откройте чат заново"})
+                yield _sse({"type": "done"})
+                return
+            if not message:
+                yield _sse({"type": "error", "detail": "пустое сообщение"})
+                yield _sse({"type": "done"})
+                return
+
+            queue: asyncio.Queue[dict | None] = asyncio.Queue()
+
+            async def emit(event: dict) -> None:
+                await queue.put(event)
+
+            async def work() -> None:
+                try:
+                    await orchestrator.run_turn(session, message, emit)
+                except Exception as e:  # noqa: BLE001 — сбой хода — событие error
+                    await queue.put({"type": "error", "detail": repr(e)[:200]})
+                finally:
+                    await queue.put(None)  # конец потока
+
+            task = asyncio.create_task(work())
+            try:
+                while (event := await queue.get()) is not None:
+                    yield _sse(event)
+            finally:
+                if not task.done():
+                    task.cancel()
+        except Exception as e:  # noqa: BLE001 — сбой хода не роняет поток
+            yield _sse({"type": "error", "detail": repr(e)[:200]})
+        yield _sse({"type": "done"})
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

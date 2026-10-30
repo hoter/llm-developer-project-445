@@ -35,6 +35,8 @@ class Session:
     pending_card: object | None = None           # живая карточка подтверждения
     pep: object | None = None                    # клиент PDP (лениво, app.pep)
     confirmed_card: object | None = None         # карточка, исполненная в сессии
+    # verdikt guardrail текущего хода: {"ok": bool, "category": str}
+    guard_state: dict = field(default_factory=lambda: {"ok": True, "category": "safe"})
     session_id: str = field(default_factory=lambda: f"sess_{uuid.uuid4().hex[:8]}")
 
     def note(self, tool: str) -> None:
@@ -87,6 +89,6 @@ def pep_of(session: Session):
             "sub": allowlist.sub,
             "role": allowlist.role,
             "scopes": list(allowlist.scopes),
-        })
+        }, session.guard_state)
         session.pep = pep
     return pep

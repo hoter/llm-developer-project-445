@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import Request
 
-from app import audit, cards, orchestrator, permissions, planner
+from app import audit, cards, guardrail_client, orchestrator, permissions, planner
 from app.sessions import get, open_session
 from core import config
 
@@ -96,18 +96,38 @@ async def card_decision(pending_id: str, request: Request) -> JSONResponse:
         return JSONResponse({"error": "session_not_found"}, status_code=404)
     card = cards.active(session)
     if card is None or card.pending_id != pending_id:
-        return JSONResponse({"error": "card_not_found", "detail": "карточка истекла или заменена"},
-                            status_code=404)
+        # карточку могла уничтожить проверка выхода (или истёк TTL)
+        return JSONResponse({
+            "error": "card_not_found",
+            "outcome": "expired",
+            "text": orchestrator._deny_text("card_not_prepared"),
+        }, status_code=404)
+
+    session.trace_id = f"tr_{uuid.uuid4().hex[:12]}"
+    # кнопка — такое же действие, как «да» в чате: сначала проверка текста,
+    # и только затем политика и исполнение
+    verdict = await guardrail_client.check("подтверждаю " + (answer or "да"), mode="input")
+    if not verdict.available:
+        session.guard_state = {"ok": False, "category": "unavailable"}
+        audit.append(orchestrator._subject(session), "guardrail", "guardrail_degraded",
+                     trace_id=session.trace_id, session_id=session.session_id,
+                     detail="кнопка карточки: сервис проверки текста недоступен")
+    if not verdict.safe:
+        cards.settle(session, card, "denied")
+        audit.append(orchestrator._subject(session), card.action, "guardrail_unsafe",
+                     trace_id=session.trace_id, session_id=session.session_id,
+                     detail=f"input:{verdict.category}")
+        return JSONResponse({"outcome": "guardrail_unsafe", "text": orchestrator.UNSAFE_TEXT})
 
     if answer in ("no", "cancel", "отмена"):
         cards.settle(session, card, "rejected")
-        audit.append(session.user.sub, card.action, "rejected_by_user",
-                     session_id=session.session_id, args=card.details)
+        audit.append(orchestrator._subject(session), card.action, "rejected_by_user",
+                     trace_id=session.trace_id, session_id=session.session_id,
+                     args=card.details)
         return JSONResponse({"outcome": "rejected", "text": "Хорошо, отменяю. Ничего не менял."})
     if answer not in ("yes", "да"):
         return JSONResponse({"error": "bad_answer", "detail": "answer: yes | no"}, status_code=400)
 
-    session.trace_id = f"tr_{uuid.uuid4().hex[:12]}"
     text = await orchestrator.execute_pending(session, card)
     return JSONResponse({"text": text})
 

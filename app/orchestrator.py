@@ -35,11 +35,42 @@ import uuid
 from collections.abc import Awaitable, Callable
 
 from app import audit, cards, editor, idempotency, planner, workers
+from app import guardrail_client
 from app.llm import run_agent
 from app.sessions import pep_of
 from core import config
 
 Emit = Callable[[dict], Awaitable[None]]
+
+UNSAFE_TEXT = ("Извините, но этот запрос похож на попытку вмешаться в работу ассистента, "
+               "и я не могу его обработать. Задайте вопрос об услугах, тарифе или списаниях — "
+               "или напишите оператору.")
+GUARD_DOWN_TEXT = ("Сейчас не работает проверка безопасности текста, поэтому изменить данные "
+                   "нельзя — могу позвать оператора, а на вопросы о тарифе и списаниях "
+                   "по-прежнему отвечу.")
+
+
+async def _output_check(session, text: str, what: str):
+    """guardrail выход: ответ и карточка проверяются до показа."""
+    verdict = await guardrail_client.check(text, mode="output")
+    if not verdict.available:
+        session.guard_state = {"ok": False, "category": "unavailable"}
+        audit.append(_subject(session), what, "guardrail_degraded",
+                     trace_id=session.trace_id, session_id=session.session_id,
+                     detail=f"сервис проверки текста недоступен при проверке {what}")
+        return guardrail_client.Verdict(safe=True, category="unavailable", available=False)
+    if not verdict.safe:
+        session.guard_state = {"ok": False, "category": verdict.category}
+        audit.append(_subject(session), what, "guardrail_unsafe",
+                     trace_id=session.trace_id, session_id=session.session_id,
+                     detail=f"output:{verdict.category}")
+    return verdict
+
+
+def _card_text(card: cards.Card) -> str:
+    """Текст карточки для проверки выходом: заголовок и значения."""
+    parts = [str(v) for v in card.view.values() if not isinstance(v, (dict, list))]
+    return " ".join([card.action, *parts, json.dumps(card.details, ensure_ascii=False)])
 
 
 def _sources(runs: list[dict]) -> list[str]:
@@ -79,6 +110,32 @@ async def run_turn(session, message: str, emit: Emit) -> None:
 
 async def _turn(session, message: str, emit: Emit) -> None:
     session.trace_id = f"tr_{uuid.uuid4().hex[:12]}"
+
+    # guardrail вход: реплика проверяется до LLM. Unsafe — вежливый отказ,
+    # ход не начинается (запись уже есть в аудите пакетом ниже).
+    verdict = await guardrail_client.check(message, mode="input")
+    if not verdict.available:
+        session.guard_state = {"ok": False, "category": "unavailable"}
+        audit.append(_subject(session), "guardrail", "guardrail_degraded",
+                     trace_id=session.trace_id, session_id=session.session_id,
+                     detail="сервис проверки текста недоступен: действия закрыты, чтение работает")
+    else:
+        session.guard_state = {"ok": True, "category": verdict.category}
+    if not verdict.safe:
+        audit.append(_subject(session), "message", "guardrail_unsafe",
+                     trace_id=session.trace_id, session_id=session.session_id,
+                     detail=f"input:{verdict.category}")
+        await emit({"type": "reply", "text": UNSAFE_TEXT, "sources": []})
+        return
+
+    # проверка текста не прошла (сервис недоступен): действия закрыты
+    # политикой, чтение работает; на «да»/«нет» по карточке — честный отказ
+    if not session.guard_state.get("ok", True):
+        card = cards.active(session)
+        if card is not None and _wants_card(message) and \
+                cards.classify_answer(message) in ("yes", "no"):
+            await emit({"type": "reply", "text": GUARD_DOWN_TEXT, "sources": []})
+            return
 
     # живая карточка: «да», «нет» и «оператор» обслуживает код, не LLM
     card = cards.active(session)
@@ -144,6 +201,12 @@ async def _turn(session, message: str, emit: Emit) -> None:
     # агент подготовил карточку — ход завершается ожиданием «да/нет»
     fresh = fresh_card(session, card)
     if fresh is not None:
+        # guardrail выход: карточку проверяем до показа; unsafe — уничтожаем
+        card_verdict = await _output_check(session, _card_text(fresh), "card")
+        if not card_verdict.safe:
+            cards.settle(session, fresh, "denied")
+            await emit({"type": "reply", "text": UNSAFE_TEXT, "sources": []})
+            return
         audit.append(_subject(session), fresh.action, "awaiting_confirmation",
                      trace_id=session.trace_id, session_id=session.session_id,
                      args=fresh.details,
@@ -176,6 +239,9 @@ async def _turn(session, message: str, emit: Emit) -> None:
     edited = await run_agent(editor.build_editor(session), editor.editor_task(message, runs),
                              trace_id=session.trace_id)
     text = editor.pick_reply(edited, _sources(runs))
+    verdict = await _output_check(session, text, "reply")
+    if not verdict.safe:
+        text = UNSAFE_TEXT
     await emit({"type": "reply", "text": text, "sources": _sources(runs)})
 
 
@@ -380,8 +446,9 @@ def _deny_text(reason: str) -> str:
                           "а больше политика не разрешает. Напишите оператору, "
                           "если нужно поменять ещё раз."),
         "confirmation_missing": "Действие не было подтверждено — подготовьте карточку заново.",
-        "card_not_prepared": "Карточка не подготовлена — повторите запрос.",
+        "card_not_prepared": "Карточка не найдена или истекла — повторите запрос.",
         "pdp_unavailable": "Сервис прав недоступен: действия сейчас закрыты, попробуйте позже.",
+        "guard_not_ok": GUARD_DOWN_TEXT,
         "no_write_scope": "Изменения тарифа недоступны: у аккаунта нет права записи.",
         "role_has_no_write": "У вашей роли нет прав на изменения — обратитесь к оператору.",
     }

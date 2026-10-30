@@ -12,9 +12,10 @@
 // ровно к этой карточке.
 
 // 1. Prepare — подготовка карточки (ничего не исполняет).
-//    Клиент с правом записи и verdikt guardrail «ок». Ключи идентичности
-//    в аргументах не допускаются: у схемы действия их нет (закрытая
-//    запись WriteInput), а второй барьер PEP отбивает их до политики.
+//    Клиент с правом записи и verdikt guardrail «ок»: вероятностный фильтр
+//    текста питает детерминированное решение. Ключи идентичности в
+//    аргументах не допускаются: у схемы действия их нет (закрытая запись
+//    WriteInput), а второй барьер PEP отбивает их до политики.
 permit (
     principal,
     action == Tel::Action::"Prepare",
@@ -35,6 +36,9 @@ permit (
     action == Tel::Action::"ConfirmCard",
     resource
 )
+when {
+    context.input.guard_ok == true
+}
 when temporal {
     formerly within 1h Tel::Action::"Prepare"::request{
         input.pending_id: context.input.pending_id
@@ -42,12 +46,16 @@ when temporal {
 };
 
 // 3. Execute — исполнение разрешено только после «да» по той же карточке:
-//    formerly ConfirmCard того же pending_id.
+//    formerly ConfirmCard того же pending_id, и только если проверка
+//    текста этого хода прошла (guard_ok).
 permit (
     principal,
     action == Tel::Action::"Execute",
     resource
 )
+when {
+    context.input.guard_ok == true
+}
 when temporal {
     formerly within 1h Tel::Action::"ConfirmCard"::request{
         input.pending_id: context.input.pending_id

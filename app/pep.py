@@ -15,8 +15,8 @@
 закрыто, абонент получает понятный отказ.
 
 В input для политики: action, pending_id, details (JSON-строка, для политики
-непрозрачна), guard_ok (verdikt guardrail; в этом контуре его нет — true)
-и субъект.
+непрозрачна), guard_ok (verdikt guardrail текущего хода: false, если
+сервис проверки текста недоступен или не пропустил реплику) и субъект.
 """
 from __future__ import annotations
 
@@ -49,6 +49,7 @@ class Pep:
     def __init__(self, session_id: str, subject: dict, guard_state: dict | None = None) -> None:
         self.session_id = session_id
         self.subject = {k: subject[k] for k in ("sub", "role", "scopes") if k in subject}
+        # тот же словарь, что у сессии: verdikt обновляется на каждом ходу
         self.guard_state = guard_state if guard_state is not None else {}
         self._opened = False
 

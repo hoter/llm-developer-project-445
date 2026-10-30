@@ -135,7 +135,11 @@ class PolicyService:
         s = self._session(session_id)
         pending_id = payload.get("pending_id")
         card = s.cards.get(pending_id)
-        if card is not None and time.monotonic() - card["ts"] > CARD_TTL_SEC:
+        if payload.get("guard_ok") is False:
+            # проверка текста не прошла: «да» не доходит до политики и не
+            # открывает Execute — так же отбивает и разрушенная карточка
+            result = {"decision": "Deny", "reason": "guard_not_ok"}
+        elif card is not None and time.monotonic() - card["ts"] > CARD_TTL_SEC:
             result = {"decision": "Deny", "reason": "confirmation_expired"}
         else:
             verdict = self._ask(s, "ConfirmCard", payload)
@@ -164,6 +168,8 @@ class PolicyService:
             reason = "card_not_prepared"
         elif pending_id not in s.confirmations:
             reason = "confirmation_missing"
+        elif payload.get("guard_ok") is False:
+            reason = "guard_not_ok"
         else:
             verdict = self._ask(s, "Execute", payload)
             if verdict != "Allow" and self._window_counting_denials(s, action):

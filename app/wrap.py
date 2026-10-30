@@ -9,16 +9,15 @@
 модели «спроси подтверждение да/нет». execute_action модель не видит
 никогда: его запускает код оркестратора после явного «да».
 
-TODO(аудит): каждый tool-вызов модели → таблицу tool_calls
-  (trace_id, tool, args — обрезанные, outcome, latency_ms).
-
-TODO(права): два барьера —
-  wrap_tools: фильтровать имена через permissions.visible_tools
-  (барьер 1: модель не видит запрещённого);
+Права — два барьера:
+  wrap_tools: имена фильтруются через permissions.visible_tools (барьер 1:
+    запрещённого инструмента модель не видит вовсе);
   invoke: permissions.admit(session.allowlist, name, args) перед вызовом
-  (барьер 2: отказ → {"error": "denied", "reason"} + запись в аудит);
-  подготовленную карточку проводить через pep.prepare — Deny → карточки
-  нет, модель получает отказ с reason.
+    (барьер 2: операция вне прав или ключ идентичности в аргументах —
+    отказ {"error": "denied", "reason"} и запись в аудит).
+
+Аудит: каждый tool-вызов модели → tool_calls (аргументы обрезаны,
+исход, задержка).
 """
 from __future__ import annotations
 
@@ -29,7 +28,7 @@ from agents import FunctionTool
 from agents.run_context import RunContextWrapper
 from mcp.shared.exceptions import MCPError
 
-from app import audit, cards
+from app import audit, cards, permissions
 from app.sessions import Session
 from core import config, db
 
@@ -65,10 +64,16 @@ def wrap_mcp_tool(session: Session, name: str) -> FunctionTool:
                 outcome = "bad_arguments"
                 return json.dumps({"error": "bad_arguments", "detail": "аргументы — JSON-объект"},
                                   ensure_ascii=False)
-            # субъект подставляет код оркестратора, модель его не видит в схеме
-            args.pop("sub", None)
-            if _has_subject(session, name):
-                args["sub"] = session.user.sub
+            # барьер 2: тройка «субъект, операция, объект» в момент вызова
+            decision = permissions.admit(session.allowlist, name, args)
+            if not decision.allowed:
+                outcome = "denied"
+                audit.append(subject_of(session), name, "denied",
+                             trace_id=session.trace_id, session_id=session.session_id,
+                             args=args, detail=decision.reason)
+                return json.dumps({"error": "denied", "reason": decision.reason,
+                                   "detail": "эта операция недоступна пользователю"},
+                                  ensure_ascii=False)
             session.note(name)
             try:
                 result = await session.pool.call(session.pool.resource_of(name), name, args)
@@ -89,7 +94,7 @@ def wrap_mcp_tool(session: Session, name: str) -> FunctionTool:
                 outcome = "card_created"
             return json.dumps(hook if hook is not None else result, ensure_ascii=False)
         finally:
-            _log_call(session, name, input_json, outcome, started)
+            log_call(session, name, input_json, outcome, started)
 
     return FunctionTool(
         name=name,
@@ -100,7 +105,7 @@ def wrap_mcp_tool(session: Session, name: str) -> FunctionTool:
     )
 
 
-def _log_call(session: Session, name: str, raw_args: str, outcome: str,
+def log_call(session: Session, name: str, raw_args: str, outcome: str,
               started: float) -> None:
     """Вызов инструмента моделью → tool_calls: аргументы обрезаны, без реплик."""
     args = {"raw": (raw_args or "")[:audit.ARGS_LIMIT]}
@@ -124,17 +129,18 @@ def _log_call(session: Session, name: str, raw_args: str, outcome: str,
         pass
 
 
-def _has_subject(session: Session, name: str) -> bool:
-    """Инструменты action-MCP принимают sub аргументом до шага прав."""
-    return session.pool.resource_of(name) == "actions"
+def subject_of(session: Session) -> str:
+    """Кто вызывает: субъект из claims токена сессии."""
+    allowlist = getattr(session, "allowlist", None)
+    return allowlist.sub if allowlist is not None else session.user.sub
 
 
 def _public_schema(schema: dict) -> dict:
-    """Схема без sub: идентичность модели не видна и не задаётся ею."""
+    """Схема без ключей идентичности: их не задаёт модель и не видит в ней."""
     schema = dict(schema or {})
-    properties = dict(schema.get("properties") or {})
-    properties.pop("sub", None)
-    required = [r for r in schema.get("required") or [] if r != "sub"]
+    properties = {k: v for k, v in (schema.get("properties") or {}).items()
+                  if k not in permissions.IDENTITY_ARGS}
+    required = [r for r in schema.get("required") or [] if r not in permissions.IDENTITY_ARGS]
     schema["properties"] = properties
     schema["required"] = required
     return schema
@@ -157,6 +163,12 @@ def _card_answer(session: Session, name: str, result: dict) -> dict | None:
 
 
 def wrap_tools(session: Session, names: list[str]) -> list[FunctionTool]:
-    """Собрать обёртки для перечня имён (какие имена давать — решает код)."""
+    """Собрать обёртки только для разрешённых субъекту инструментов.
+
+    Барьер 1 — здесь: запрещённое имя не превращается в инструмент агента,
+    поэтому модель его не видит.
+    """
     known = set(session.pool.tool_names())
-    return [wrap_mcp_tool(session, n) for n in names if n in known and n not in EXECUTION_ONLY]
+    candidates = [n for n in names if n in known and n not in EXECUTION_ONLY]
+    allowed = permissions.visible_tools(session.allowlist, candidates)
+    return [wrap_mcp_tool(session, n) for n in allowed]

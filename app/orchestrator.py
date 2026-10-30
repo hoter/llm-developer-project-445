@@ -102,7 +102,7 @@ async def _turn(session, message: str, emit: Emit) -> None:
             return
         if answer == "no":
             cards.settle(session, card, "rejected")
-            audit.append(session.user.sub, card.action, "rejected_by_user",
+            audit.append(_subject(session), card.action, "rejected_by_user",
                          trace_id=session.trace_id, session_id=session.session_id,
                          args=card.details, idempotency_key=f"{card.action}:{card.pending_id}",
                          detail=f"карточка {card.pending_id} отменена пользователем")
@@ -144,7 +144,7 @@ async def _turn(session, message: str, emit: Emit) -> None:
     # агент подготовил карточку — ход завершается ожиданием «да/нет»
     fresh = fresh_card(session, card)
     if fresh is not None:
-        audit.append(session.user.sub, fresh.action, "awaiting_confirmation",
+        audit.append(_subject(session), fresh.action, "awaiting_confirmation",
                      trace_id=session.trace_id, session_id=session.session_id,
                      args=fresh.details,
                      detail=f"подготовлена карточка {fresh.pending_id}, ждём «да»")
@@ -159,7 +159,7 @@ async def _turn(session, message: str, emit: Emit) -> None:
         for call in run.get("tools", []):
             output = call.get("output") or {}
             if call.get("tool") == "create_ticket" and output.get("ticket_id"):
-                audit.append(session.user.sub, "create_ticket", "escalated",
+                audit.append(_subject(session), "create_ticket", "escalated",
                              trace_id=session.trace_id, session_id=session.session_id,
                              args={"via": "tickets"}, after={"ticket_id": output["ticket_id"]},
                              idempotency_key=f"ticket:{output['ticket_id']}")
@@ -167,7 +167,7 @@ async def _turn(session, message: str, emit: Emit) -> None:
     # агент не подготовил карточку: говорим исход прямо, а не доклад агента
     blocked = refused(runs)
     if blocked is not None:
-        audit.append(session.user.sub, "action_prepare", "rejected_by_contract",
+        audit.append(_subject(session), "action_prepare", "rejected_by_contract",
                      trace_id=session.trace_id, session_id=session.session_id,
                      detail=blocked[:200])
         await emit({"type": "reply", "text": blocked, "sources": []})
@@ -279,9 +279,9 @@ async def execute_pending(session, card: cards.Card) -> str:
         })
 
     try:
-        stored = await idempotency.execute(key, session.user.sub, card.action, run)
+        stored = await idempotency.execute(key, _subject(session), card.action, run)
     except Exception as e:  # noqa: BLE001 — сбой исполнения: карточка живёт, ключ не занят
-        audit.append(session.user.sub, card.action, "error", trace_id=session.trace_id,
+        audit.append(_subject(session), card.action, "error", trace_id=session.trace_id,
                      session_id=session.session_id, args=card.details,
                      idempotency_key=key, detail=str(e)[:200])
         return "Не удалось исполнить действие, попробуйте ответить «да» ещё раз."
@@ -292,7 +292,7 @@ async def execute_pending(session, card: cards.Card) -> str:
     if stored.duplicate or outcome == "duplicate":
         cards.settle(session, card, "confirmed")
         session.confirmed_card = card
-        audit.append(session.user.sub, card.action, "duplicate_suppressed",
+        audit.append(_subject(session), card.action, "duplicate_suppressed",
                      trace_id=session.trace_id, session_id=session.session_id,
                      args=card.details, before=before, after=after,
                      idempotency_key=key, detail="карточка уже исполнена")
@@ -301,14 +301,14 @@ async def execute_pending(session, card: cards.Card) -> str:
     if outcome == "executed":
         cards.settle(session, card, "confirmed")
         session.confirmed_card = card
-        audit.append(session.user.sub, card.action, "executed",
+        audit.append(_subject(session), card.action, "executed",
                      trace_id=session.trace_id, session_id=session.session_id,
                      args=card.details, before=before, after=after, idempotency_key=key)
         return result.get("message") or "Готово."
 
     if outcome == "daily_limit":
         cards.settle(session, card, "denied")
-        audit.append(session.user.sub, card.action, "server_limit", trace_id=session.trace_id,
+        audit.append(_subject(session), card.action, "server_limit", trace_id=session.trace_id,
                      session_id=session.session_id, args=card.details,
                      idempotency_key=key, detail=str(result)[:200])
         limit = result.get("limit", 3)
@@ -317,7 +317,7 @@ async def execute_pending(session, card: cards.Card) -> str:
 
     # прочий отказ бизнес-правила: карточка закрыта, ключ не занят
     cards.settle(session, card, "denied")
-    audit.append(session.user.sub, card.action, "rejected_by_contract", trace_id=session.trace_id,
+    audit.append(_subject(session), card.action, "rejected_by_contract", trace_id=session.trace_id,
                  session_id=session.session_id, args=card.details,
                  idempotency_key=key, detail=str(result)[:200])
     return result.get("message") or "Действие отклонено."
@@ -340,19 +340,24 @@ async def _state_of(session, card: cards.Card) -> str | None:
     return None
 
 
-def _who(session, card: cards.Card) -> str:
-    """Кто действовал: субъект сессии (карточка привязана к нему же)."""
-    return session.user.sub
+def _subject(session) -> str:
+    """Кто действует: субъект из проверенных claims токена сессии."""
+    allowlist = getattr(session, "allowlist", None)
+    return allowlist.sub if allowlist is not None and allowlist.sub else session.user.sub
 
 
 async def call_action(session, tool: str, args: dict) -> dict:
-    """Вызов action-MCP из кода: субъект подставляет оркестратор, не модель."""
-    return await session.pool.call("actions", tool, {**args, "sub": session.user.sub})
+    """Вызов action-MCP из кода.
+
+    Субъекта в аргументах нет: сервер берёт его из Bearer-токена
+    соединения, поэтому подставить чужой sub в вызов невозможно.
+    """
+    return await session.pool.call("actions", tool, dict(args))
 
 
 async def _deny_card(session, card: cards.Card, reason: str) -> None:
     cards.settle(session, card, "denied")
-    audit.append(session.user.sub, card.action, "denied", trace_id=session.trace_id,
+    audit.append(_subject(session), card.action, "denied", trace_id=session.trace_id,
                  session_id=session.session_id, args=card.details, detail=reason)
 
 
@@ -369,7 +374,7 @@ async def escalate(session, message: str, card: cards.Card | None = None) -> str
     """Эскалация: обращение в поддержку без карточки (риск низкий, но в аудит)."""
     if card is not None:
         cards.settle(session, card, "rejected")
-        audit.append(session.user.sub, card.action, "rejected_by_user",
+        audit.append(_subject(session), card.action, "rejected_by_user",
                      trace_id=session.trace_id, session_id=session.session_id,
                      args=card.details, detail="заменена обращением к оператору")
     subject = "Обращение из чата"
@@ -379,12 +384,12 @@ async def escalate(session, message: str, card: cards.Card | None = None) -> str
             "subject": subject, "note": note,
         })
     except Exception as e:  # noqa: BLE001 — сбой эскалации не роняет ход
-        audit.append(session.user.sub, "create_ticket", "error", trace_id=session.trace_id,
+        audit.append(_subject(session), "create_ticket", "error", trace_id=session.trace_id,
                      session_id=session.session_id, detail=str(e)[:200])
         return "Не удалось создать обращение. Попробуйте позже."
     ticket = result.get("ticket_id", "")
     # в журнал — факт обращения и номер, не текст реплики абонента
-    audit.append(session.user.sub, "create_ticket", "escalated", trace_id=session.trace_id,
+    audit.append(_subject(session), "create_ticket", "escalated", trace_id=session.trace_id,
                  session_id=session.session_id,
                  args={"subject": subject}, after={"ticket_id": ticket},
                  idempotency_key=f"ticket:{ticket}")

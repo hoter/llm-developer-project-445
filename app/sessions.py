@@ -15,6 +15,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 
+from app.permissions import allowlist_from_claims
 from core import config, db
 from core.mcpclient import McpPool
 from core.tokens import Tokens
@@ -26,6 +27,7 @@ class Session:
     user: config.User
     tokens: Tokens
     pool: McpPool
+    allowlist: object | None = None              # права из claims (app.permissions)
     thread: list = field(default_factory=list)   # история планировщика
     trace: list[str] = field(default_factory=list)
     trace_id: str = ""                           # сквозной id текущего хода
@@ -48,15 +50,15 @@ async def open_session(login: str) -> Session:
         raise KeyError(f"неизвестный пользователь: {login}")
 
     tokens = Tokens(login)
-    # action-MCP подключается, когда у пользователя есть права на запись:
-    # у клиента только на чтение инструментов действий нет
-    resources = ["crm", "billing", "kb"]
-    if may_write(user):
-        resources.append("actions")
-    pool = McpPool(tokens, resource_keys=tuple(resources))
+    pool = McpPool(tokens, resource_keys=("crm", "billing", "kb", "actions"))
     await pool.connect()
 
-    session = Session(login=login, user=user, tokens=tokens, pool=pool)
+    # allowlist строится из claims токена, проверенного издателем, а не
+    # из локальной конфигурации пользователя
+    claims = await tokens.claims("actions")
+    allowlist = allowlist_from_claims(claims)
+
+    session = Session(login=login, user=user, tokens=tokens, pool=pool, allowlist=allowlist)
     db.execute(
         "insert into sessions(session_id, login, sub) values (%s, %s, %s)",
         (session.session_id, login, user.sub),
@@ -75,15 +77,16 @@ def get(session_id: str) -> Session | None:
 
 
 def pep_of(session: Session):
-    """PEP сессии: создаётся при первом обращении (субъект — из сессии)."""
+    """PEP сессии: создаётся при первом обращении; субъект — из claims токена."""
     from app.pep import Pep
 
     pep = session.pep
     if pep is None:
+        allowlist = session.allowlist
         pep = Pep(session.session_id, {
-            "sub": session.user.sub,
-            "role": session.user.role,
-            "scopes": list(session.user.scopes),
+            "sub": allowlist.sub,
+            "role": allowlist.role,
+            "scopes": list(allowlist.scopes),
         })
         session.pep = pep
     return pep

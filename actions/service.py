@@ -3,8 +3,8 @@
 prepare_* ничего не исполняют: проверяют предусловия по текущему
 состоянию абонента и собирают карточку «с какого на какой, что изменится».
 Исполнение — execute_action, его вызывает только код оркестратора после
-явного «да». Субъект sub приходит аргументом до прав (осознанная дыра):
-подставляет его обёртка оркестратора, модель его не видит.
+явного «да». Субъект sub здесь — уже проверенный сервером субъект токена:
+его передаёт actions/server.py, а не клиент и не модель.
 """
 from __future__ import annotations
 
@@ -45,6 +45,21 @@ async def _post(path: str, body: dict) -> dict:
         r = await c.post(path, json=body)
         r.raise_for_status()
         return r.json()
+
+
+FORBIDDEN_CODE = -32003  # прикладной код контура: роль не подходит
+
+
+def _require_operator() -> None:
+    """Роль из проверенного токена: чужую карточку читает только оператор."""
+    from mcp.server.auth.middleware.auth_context import get_access_token
+    from mcp.shared.exceptions import MCPError
+
+    token = get_access_token()
+    role = (token.claims or {}).get("role") if token is not None else None
+    if role != "operator":
+        raise MCPError(code=FORBIDDEN_CODE, message="forbidden: role required",
+                       data={"error": "forbidden", "required_roles": ["operator"]})
 
 
 async def _subscriber(sub: str) -> dict:
@@ -265,6 +280,30 @@ def _parse_details(details_json: str) -> dict:
     if not isinstance(value, dict):
         raise ActionError("bad_details", "details_json должен быть JSON-объектом")
     return value
+
+
+async def subscriber_overview(sub: str, subscriber_id: str) -> dict:
+    """Обзор абонента по id (оператор): обзор из CRM плюс контакты и услуги из профиля.
+
+    Роль проверяет сервер по claims токена: чужой идентификатор легитимен
+    только оператору.
+    """
+    _require_operator()
+    try:
+        rec = await _get("/mock/crm/subscriber", sub=subscriber_id)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise ActionError("not_found", "абонент не найден", sub=subscriber_id) from e
+        raise
+    return {
+        "subscriber_id": rec["sub"],
+        "name": rec["name"],
+        "phone": rec["phone"],
+        "email": rec.get("email"),
+        "tariff": rec["tariff"],
+        "balance_rub": rec.get("balance_rub"),
+        "services": [dict(row) for row in rec.get("services", [])],
+    }
 
 
 async def create_ticket(sub: str, subject: str, note: str) -> dict:

@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import Request
 
-from app import audit, cards, orchestrator, planner
+from app import audit, cards, orchestrator, permissions, planner
 from app.sessions import get, open_session
 from core import config
 
@@ -54,8 +54,8 @@ async def _json_body(request: Request) -> dict:
 
 
 def _visible_tools(session) -> list[str]:
-    names = set(session.pool.tool_names())
-    return [n for n in sorted(names) if session.pool.resource_of(n) != "actions"]
+    """Барьер 1 как его видит фронтенд: только разрешённые субъекту имена."""
+    return permissions.visible_tools(session.allowlist, session.pool.tool_names())
 
 
 @app.get("/api/health")

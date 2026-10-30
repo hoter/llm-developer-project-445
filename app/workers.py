@@ -158,15 +158,28 @@ def _find_subscribers(session):
     """Поиск абонента по имени, логину или номеру (только оператор)."""
     from agents import FunctionTool
 
+    from app.audit import append
+    from app.permissions import admit
+    from app.wrap import log_call, subject_of
     from core import db
 
+    name = "find_subscribers"
+
     async def invoke(ctx, input_json: str) -> str:
+        started = time.monotonic()
         try:
             args = json.loads(input_json or "{}")
         except ValueError:
             args = {}
         query = str(args.get("query", "")).strip()
+        decision = admit(session.allowlist, name, args)
+        if not decision.allowed:
+            log_call(session, name, input_json, "denied", started)
+            append(subject_of(session), name, "denied", trace_id=session.trace_id,
+                         session_id=session.session_id, detail=decision.reason)
+            return json.dumps({"error": "denied", "reason": decision.reason}, ensure_ascii=False)
         if not query:
+            log_call(session, name, input_json, "bad_arguments", started)
             return json.dumps({"error": "empty_query", "detail": "укажи имя, логин или номер"},
                               ensure_ascii=False)
         pattern = f"%{query.lower()}%"
@@ -176,7 +189,8 @@ def _find_subscribers(session):
             " order by name limit 5",
             (pattern, pattern, pattern),
         )
-        session.note("find_subscribers")
+        session.note(name)
+        log_call(session, name, input_json, "ok", started)
         return json.dumps({"subscribers": rows}, ensure_ascii=False)
 
     return FunctionTool(
@@ -207,7 +221,7 @@ def build_workers(session, agent_ids: tuple[str, ...] = ("data", "kb")) -> dict:
         mcp_names = [n for n in names if n in set(session.pool.tool_names())]
         tools = [*wrap_tools(session, mcp_names), *_local_tools(session, names)]
         prompt = spec["prompt"]
-        if not any(n in mcp_names for n in ACTION_TOOLS):
+        if not any(t.name in ACTION_TOOLS for t in tools):
             # барьер 1: prepare_* недоступны — отдельный промпт без попыток
             prompt = spec.get("no_access_prompt", prompt)
         workers[agent_id] = build_agent(f"{agent_id}_worker", prompt, tools=tools)

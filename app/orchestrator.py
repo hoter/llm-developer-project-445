@@ -236,6 +236,17 @@ async def _turn(session, message: str, emit: Emit) -> None:
         await emit({"type": "reply", "text": blocked, "sources": []})
         return
 
+    # агент звал prepare повторно (карточка уже готова), но так и не написал
+    # ответ: карточку всё равно показываем — пересказ модели здесь не нужен
+    if fresh is None and session.pending_card is not None and any(
+            call.get("tool") in ("prepare_tariff_change", "prepare_toggle_service",
+                                 "prepare_contacts_update")
+            for run in runs for call in run.get("tools", [])):
+        fresh = session.pending_card
+        await emit({"type": "card", "pending_id": fresh.pending_id,
+                    "card": fresh.public_view(config.CARD_TTL_SEC)})
+        return
+
     edited = await run_agent(editor.build_editor(session), editor.editor_task(message, runs),
                              trace_id=session.trace_id)
     text = editor.pick_reply(edited, _sources(runs))
@@ -443,7 +454,7 @@ def _deny_text(reason: str) -> str:
     texts = {
         "confirmation_expired": "Карточка устарела — повторите запрос, и я подготовлю её заново.",
         "session_limit": ("Пока не получилось: в этой сессии уже две смены тарифа, "
-                          "а больше политика не разрешает. Напишите оператору, "
+                          "а больше политика (лимит сессии) не разрешает. Напишите оператору, "
                           "если нужно поменять ещё раз."),
         "confirmation_missing": "Действие не было подтверждено — подготовьте карточку заново.",
         "card_not_prepared": "Карточка не найдена или истекла — повторите запрос.",

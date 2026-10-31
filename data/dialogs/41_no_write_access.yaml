@@ -1,0 +1,12 @@
+# Отказ: Борис — клиент только на чтение. Смена тарифа ему недоступна:
+# карточки нет, тариф в моке не изменился.
+name: 41_no_write_access
+user: boris
+turns:
+  - say: переведи меня на семейный
+    expect:
+      card: false
+      reply_contains: ["прав"]
+    state:
+      tariff: Игровой
+      sub: u_9b1c

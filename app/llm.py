@@ -141,7 +141,7 @@ async def run_agent(agent: Agent, task: str, *, trace_id: str = "") -> dict:
     """
     started = time.monotonic()
     try:
-        result = await Runner.run(agent, task, max_turns=6)
+        result = await Runner.run(agent, task, max_turns=10)
     except Exception as e:
         # неуспешный запуск тоже в журнале: видно, что модель не ответила
         _log_call(agent, None, trace_id, time.monotonic() - started)

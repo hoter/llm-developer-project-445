@@ -1,0 +1,16 @@
+# Отказ пользователя: карточка подготовлена, абонент передумал.
+# Проверяем главное — отсутствие эффекта: тариф не сменился.
+name: 40_tariff_change_cancel
+user: anna
+turns:
+  - say: переведи меня на семейный
+    expect:
+      plan_has: [tariff]
+      card: true
+    state: { unchanged: true }
+  - say: нет, не надо
+    expect:
+      card: false
+      reply_contains: ["тмен"]
+    state:
+      tariff: Базовый

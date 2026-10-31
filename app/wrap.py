@@ -174,6 +174,7 @@ async def _card_answer(session: Session, name: str, result: dict) -> dict | None
         "card": public,
         "summary": result.get("summary", ""),
         "next": "перескажи карточку и спроси подтверждение «да/нет»",
+        "already_prepared": True,
     }
 
 

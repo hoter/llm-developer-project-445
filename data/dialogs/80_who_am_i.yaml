@@ -1,0 +1,17 @@
+# Свой сценарий: абонент уточняет свои данные и услуги, ничего не меняя.
+# Главное ожидание — состояние: чтение ничего не меняет в моках.
+name: 80_who_am_i
+user: anna
+turns:
+  - say: на чьё имя оформлен мой номер и какая почта в карточке?
+    expect:
+      card: false
+    state: { unchanged: true }
+  - say: а какие услуги у меня сейчас подключены?
+    expect:
+      card: false
+    state: { unchanged: true }
+  - say: спасибо, ничего менять не нужно
+    expect:
+      card: false
+    state: { unchanged: true }

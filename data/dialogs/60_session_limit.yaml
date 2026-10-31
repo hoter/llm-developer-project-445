@@ -1,0 +1,27 @@
+# Лимит: три смены тарифа подряд с «да». Политика разрешает две смены за
+# сессию (forbid count_within > 2), третья упирается в session_limit —
+# тариф остаётся Базовый, всё решает политика, без ручных действий.
+name: 60_session_limit
+user: anna
+turns:
+  - say: переведи меня на семейный
+    expect:
+      plan_has: [tariff]
+      card: true
+  - say: да
+    state:
+      tariff: Семейный
+  - say: переведи меня на игровой
+    expect:
+      card: true
+  - say: да
+    state:
+      tariff: Игровой
+  - say: переведи меня на базовый
+    expect:
+      card: true
+  - say: да
+    expect:
+      reply_contains: ["лимит"]
+    state:
+      tariff: Игровой

@@ -59,9 +59,38 @@ def _get_text(events: list[dict]) -> str:
     return "\n".join(replies)
 
 
-async def check_expectations(c: httpx.AsyncClient, scenario: dict, turn_events: list[dict]) -> tuple[bool, str]:
-    """Ожидания реплики — по событиям этого хода; состояние — по мокам сейчас."""
-    expect = scenario.get("expect", {}) or {}
+async def snapshot(c: httpx.AsyncClient, sub: str = "u_4f2a") -> dict:
+    """Снимок доменного состояния моков: тариф, услуги, тикеты, списания."""
+    r = await c.get(f"{config.STAND_URL}/mock/crm/subscriber?sub={sub}")
+    record = r.json()
+    services = {row["service"]: row["enabled"] for row in record.get("services", [])}
+    r = await c.get(f"{config.STAND_URL}/mock/tickets?sub={sub}")
+    tickets = len(r.json().get("tickets", []))
+    r = await c.get(f"{config.STAND_URL}/mock/billing/charges?sub={sub}")
+    charges = len(r.json().get("charges", []))
+    return {"tariff": record.get("tariff"), "services": services, "tickets": tickets,
+            "charges": charges, "phone": record.get("phone"), "email": record.get("email")}
+
+
+def diff(before: dict, after: dict) -> list[str]:
+    """Что изменилось между снимками — для сообщения об упавшем ожидании."""
+    changes = []
+    for key in before:
+        if before[key] != after.get(key):
+            changes.append(f"{key}: {before[key]!r} → {after.get(key)!r}")
+    return changes
+
+
+async def check_expectations(c: httpx.AsyncClient, turn: dict) -> tuple[bool, str]:
+    """Ожидания реплики — по событиям этого хода; состояние — по мокам сейчас.
+
+    Блок expect описывает ход, блок state — состояние моков после него:
+      tariff / service / tickets_min / sub — проверка значения;
+      unchanged: true — после хода не должно измениться ничего (атака,
+        отказ: «тариф не сменился» — такое же ожидание, как и «сменился»).
+    """
+    turn_events = turn["events"]
+    expect = turn.get("expect", {}) or {}
     plan_events = [e for e in turn_events if e.get("type") == "plan"]
     cards = [e for e in turn_events if e.get("type") == "card"]
     text = _get_text(turn_events)
@@ -81,7 +110,17 @@ async def check_expectations(c: httpx.AsyncClient, scenario: dict, turn_events: 
         if needle.lower() in text.lower():
             return False, f"в ответе лишнее «{needle}»"
 
-    state = expect.get("state", {}) or {}
+    state = turn.get("state", {}) or {}
+    if state.get("unchanged"):
+        changes = diff(turn["before"], await snapshot(c, state.get("sub", "u_4f2a")))
+        if changes:
+            return False, "состояние моков изменилось: " + "; ".join(changes)
+        return True, ""
+    if state.get("changed"):
+        changes = diff(turn["before"], await snapshot(c, state.get("sub", "u_4f2a")))
+        if not changes:
+            return False, "ожидалось изменение состояния моков, но ничего не изменилось"
+        return True, ""
     if "tariff" in state:
         sub = state.get("sub", "u_4f2a")
         r = await c.get(f"{config.STAND_URL}/mock/crm/subscriber?sub={sub}")
@@ -96,7 +135,8 @@ async def check_expectations(c: httpx.AsyncClient, scenario: dict, turn_events: 
         if actual != svc["enabled"]:
             return False, f"услуга {svc['name']}={actual}, ожидалось {svc['enabled']}"
     if "tickets_min" in state:
-        r = await c.get(f"{config.STAND_URL}/mock/tickets?sub=u_4f2a")
+        sub = state.get("sub", "u_4f2a")
+        r = await c.get(f"{config.STAND_URL}/mock/tickets?sub={sub}")
         if len(r.json().get("tickets", [])) < state["tickets_min"]:
             return False, f"тикетов меньше {state['tickets_min']}"
     return True, ""
@@ -112,9 +152,11 @@ async def run_scenario(c: httpx.AsyncClient, path: Path) -> None:
 
     all_events: list[dict] = []
     for turn in scenario["turns"]:
+        before = await snapshot(c, (turn.get("state") or {}).get("sub", "u_4f2a"))
         events = await chat_turn(c, session_id, turn["say"])
         all_events.extend(events)
-        ok, why = await check_expectations(c, turn, events)
+        turn = {**turn, "events": events, "before": before}
+        ok, why = await check_expectations(c, turn)
         if not ok:
             RESULTS.append((name, False, f"реплика «{turn['say'][:40]}»: {why}"))
             return

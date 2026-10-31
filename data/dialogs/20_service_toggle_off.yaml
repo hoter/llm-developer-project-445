@@ -1,0 +1,14 @@
+# Успех: отключение услуги через карточку. Музыка у Анны включена.
+name: 20_service_toggle_off
+user: anna
+turns:
+  - say: отключи Музыку
+    expect:
+      plan_has: [tariff]
+      card: true
+    state: { unchanged: true }
+  - say: да
+    expect:
+      card: false
+    state:
+      service: { name: "Музыка", enabled: false }

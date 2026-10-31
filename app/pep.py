@@ -64,27 +64,41 @@ class Pep:
             return r.json()
 
     async def _open(self) -> None:
-        if self._opened:
-            return
-        await self._post("/session", {"session_id": self.session_id, "subject": self.subject})
-        self._opened = True
+        # PDP мог перезапуститься: сессия теряется вместе с процессом, и
+        # Prepare получает 404. Тогда заново открываем сессию (один раз)
+        # и повторяем запрос — решение по-прежнему за политикой
+        if not self._opened:
+            await self._post("/session", {"session_id": self.session_id, "subject": self.subject})
+            self._opened = True
 
-    def _input(self, card) -> dict:
+    async def _post_with_session(self, path: str, payload: dict) -> dict:
+        try:
+            return await self._post(path, payload)
+        except Exception as e:  # noqa: BLE001 — 404 значит «PDP забыл сессию»
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status != 404:
+                raise
+            self._opened = False
+            await self._open()
+            return await self._post(path, payload)
+
+    def _input(self, card, guard_ok: bool | None = None) -> dict:
         return {
             "action": card.action,
             "pending_id": card.pending_id,
             "details": json.dumps(card.details, ensure_ascii=False),
-            "guard_ok": bool(self.guard_state.get("ok", True)),
+            "guard_ok": bool(self.guard_state.get("ok", True)) if guard_ok is None else bool(guard_ok),
             **self.subject,
         }
 
-    async def _ask(self, path: str, action: str | None, card) -> Decision:
-        payload = {"session_id": self.session_id, "input": self._input(card)}
+    async def _ask(self, path: str, action: str | None, card,
+                   guard_ok: bool | None = None) -> Decision:
+        payload = {"session_id": self.session_id, "input": self._input(card, guard_ok)}
         if action is not None:
             payload["action"] = action
         try:
             await self._open()
-            body = await self._post(path, payload)
+            body = await self._post_with_session(path, payload)
         except Exception:  # noqa: BLE001 — PDP недоступен: действия закрыты
             return Decision(False, PDP_DOWN)
         return Decision(str(body.get("decision", "")).lower() == "allow",
@@ -97,5 +111,7 @@ class Pep:
         # «да»: PDP сам добавляет action=ConfirmCard в input
         return await self._ask("/confirm", None, card)
 
-    async def execute(self, card) -> Decision:
-        return await self._ask("/authorize", "Execute", card)
+    async def execute(self, card, guard_ok: bool | None = None) -> Decision:
+        """Execute. guard_ok=False — спросить политику так, будто текстовый
+        фильтр не прошёл: решение о закрытии остаётся за ней."""
+        return await self._ask("/authorize", "Execute", card, guard_ok)

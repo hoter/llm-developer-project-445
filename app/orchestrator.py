@@ -99,13 +99,9 @@ def _plan_event(plan, dropped: list[dict]) -> dict:
 
 
 async def run_turn(session, message: str, emit: Emit) -> None:
-    """Один ход для SSE: карточка → (план → гейт → агенты → редактор), затем done.
-
-    События done нет в самом ходе: ленте оно нужно как маркер конца, а
-    коду (и smoke) — нет.
-    """
+    # маркер конца потока (done) добавляет HTTP-граница, не сам ход:
+    # коду и smoke он не нужен
     await _turn(session, message, emit)
-    await emit({"type": "done"})
 
 
 async def _turn(session, message: str, emit: Emit) -> None:
@@ -343,9 +339,14 @@ async def execute_pending(session, card: cards.Card) -> str:
 
     Ключ f"{action}:{pending_id}" — одно «да» — одна операция; повтор
     получает сохранённый результат. Неудачный исход ключ не занимает.
+    Исполнение пишется в trace_id того хода, в котором пришло «да»; ход
+    подготовки связан с ним session_id и idempotency_key.
     """
     # PEP: «да» → ConfirmCard → Execute. Решает политика; Deny (включая
     # недоступный PDP) закрывает карточку и не доходит до исполнения.
+    # Своей трассировки у исполнения нет: оно принадлежит ходу, в котором
+    # пришло «да» (вызванному кодом или кнопкой карточки), и разбор по
+    # trace_id видит сразу и политику, и executed с before/after.
     pep = pep_of(session)
     confirm = await pep.confirm(card)
     if confirm.allowed:
@@ -355,6 +356,15 @@ async def execute_pending(session, card: cards.Card) -> str:
     if not execute.allowed:
         await _deny_card(session, card, execute.reason)
         return _deny_text(execute.reason)
+    # политика проверяет guard_ok по тому, что PEP положил в input; проверка
+    # исполнения не должна зависеть от порядка шагов в контуре: если текстовый
+    # фильтр не прошёл, у политики спрашиваем Execute с guard_ok=false —
+    # решение всё равно её (guard_not_ok), а не оркестратора
+    if not session.guard_state.get("ok", True):
+        execute = await pep.execute(card, guard_ok=False)
+        if not execute.allowed:
+            await _deny_card(session, card, execute.reason)
+            return _deny_text(execute.reason)
 
     before = await _state_of(session, card)
     key = f"{card.action}:{card.pending_id}"

@@ -28,6 +28,7 @@ class Card:
     view: dict
     session_id: str
     sub: str
+    prepare_trace_id: str = ""   # trace хода, где карточка готовилась
 
     def public_view(self, ttl_sec: int) -> dict:
         return {**self.view, "action": self.action, "ttl_sec": ttl_sec}

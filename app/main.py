@@ -96,6 +96,14 @@ async def card_decision(pending_id: str, request: Request) -> JSONResponse:
         return JSONResponse({"error": "session_not_found"}, status_code=404)
     card = cards.active(session)
     if card is None or card.pending_id != pending_id:
+        # повтор «да» по только что исполненной карточке: исполнение ведёт
+        # идемпотентность (ключ тот же) и ответит «уже исполнена», а не 404
+        previous = orchestrator.last_card(session)
+        if (answer in ("yes", "да") and previous is not None
+                and previous.pending_id == pending_id):
+            session.trace_id = f"tr_{uuid.uuid4().hex[:12]}"
+            text = await orchestrator.execute_pending(session, previous)
+            return JSONResponse({"outcome": "repeat", "text": text})
         # карточку могла уничтожить проверка выхода (или истёк TTL)
         return JSONResponse({
             "error": "card_not_found",

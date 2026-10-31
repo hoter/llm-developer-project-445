@@ -162,6 +162,11 @@ class PolicyService:
         подготовленных и подтверждённых карточек.
         """
         s = self._session(session_id)
+        if payload.get("guard_ok") is False:
+            # текстовый фильтр не прошёл: решение политики по guard_ok,
+            # в историю исполнений карточка не попадает
+            _audit(s.session_id, s.subject["sub"], "Execute", "Deny", "guard_not_ok")
+            return {"decision": "Deny", "reason": "guard_not_ok"}
         action = payload.get("action", "")
         pending_id = payload.get("pending_id")
         if pending_id not in s.cards:

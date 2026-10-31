@@ -143,11 +143,14 @@ async def run_agent(agent: Agent, task: str, *, trace_id: str = "") -> dict:
     try:
         result = await Runner.run(agent, task, max_turns=10)
     except Exception as e:
-        # неуспешный запуск тоже в журнале: видно, что модель не ответила
+        # неуспешный запуск тоже в журнале: видно, что модель не ответила;
+        # сбой агента не роняет ход — редактор ответит без его доклада
         _log_call(agent, None, trace_id, time.monotonic() - started)
         audit.append(getattr(agent, "name", "?"), "llm_run", "error", trace_id=trace_id,
                      detail=repr(e)[:200])
-        raise
+        return {"report": "", "tools": [], "seconds": round(time.monotonic() - started, 2),
+                "usage": {"input_tokens": 0, "output_tokens": 0}, "messages": [],
+                "error": repr(e)[:200]}
     seconds = time.monotonic() - started
     tools = collect_tool_runs(result)
 

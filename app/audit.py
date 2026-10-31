@@ -96,11 +96,19 @@ def trace(trace_id: str) -> list[dict]:
 
 
 def timeline(trace_id: str) -> list[dict]:
-    """Хронология хода из трёх журналов: audit_log, llm_calls, tool_calls.
+    """Хронология хода: audit_log, llm_calls, tool_calls и policy_events.
 
-    Записи LLM и инструментов хранят id в пределах своей таблицы, поэтому
-    порядок между таблицами — по времени (ts, затем порядок вставки).
+    Записи разных таблиц упорядочены по времени; решения политики берутся
+    за окно хода (policy_events не хранит trace_id).
     """
+    events = _journal_events(trace_id)
+    events.sort(key=lambda e: (e["at"], _kind_order(e["kind"])))
+    return events
+
+
+def _journal_events(trace_id: str) -> list[dict]:
+    """События одного trace из audit_log, llm_calls, tool_calls, policy_events."""
+    session_id = next((r.get("session_id") for r in trace(trace_id) if r.get("session_id")), None)
     events: list[dict] = []
     for row in trace(trace_id):
         events.append({
@@ -122,12 +130,32 @@ def timeline(trace_id: str) -> list[dict]:
             "args": row.get("args"), "outcome": row.get("outcome"),
             "latency_ms": row.get("latency_ms"),
         })
-    events.sort(key=lambda e: (e["at"], _kind_order(e["kind"])))
+    if session_id:
+        # policy_events не хранит trace_id: решения сессии за окно хода —
+        # от первой записи хода до последней плюс секунды (PDP пишет
+        # решение раньше записи аудита, между ними — сеть)
+        window_start = min((e["at"] for e in events), default=None)
+        window_end = max((e["at"] for e in events), default=None)
+        if window_start is not None:
+            from datetime import timedelta
+
+            # окно чуть шире хода: решения политики пишутся раньше записи
+            # аудита (сеть между PDP и оркестратором), а ход «да» может
+            # начаться с самой записи executed
+            for row in db.fetchall(
+                "select * from policy_events where session_id = %s and ts >= %s and ts <= %s"
+                " order by id",
+                (session_id, window_start - timedelta(seconds=5), window_end),
+            ):
+                events.append({
+                    "at": row["ts"], "kind": "policy", "what": row.get("action"),
+                    "outcome": row.get("decision"), "detail": row.get("reason"),
+                })
     return events
 
 
 def _kind_order(kind: str) -> int:
-    return {"tool": 0, "llm": 1, "audit": 2}.get(kind, 3)
+    return {"tool": 0, "policy": 1, "llm": 2, "audit": 3}.get(kind, 4)
 
 
 def _plain(row: dict) -> dict:

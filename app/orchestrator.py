@@ -67,6 +67,13 @@ async def _output_check(session, text: str, what: str):
     return verdict
 
 
+def _fingerprint(text: str) -> str:
+    """Короткий отпечаток реплики для журнала вместо самого текста."""
+    import hashlib
+
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:10]
+
+
 def _card_text(card: cards.Card) -> str:
     """Текст карточки для проверки выходом: заголовок и значения."""
     parts = [str(v) for v in card.view.values() if not isinstance(v, (dict, list))]
@@ -118,9 +125,11 @@ async def _turn(session, message: str, emit: Emit) -> None:
     else:
         session.guard_state = {"ok": True, "category": verdict.category}
     if not verdict.safe:
+        # текст реплики в журнал не пишем: только категория и короткий
+        # отпечаток, чтобы разбор мог сопоставить отказ с репликой
         audit.append(_subject(session), "message", "guardrail_unsafe",
                      trace_id=session.trace_id, session_id=session.session_id,
-                     detail=f"input:{verdict.category}")
+                     detail=f"input:{verdict.category} fp={_fingerprint(message)}")
         await emit({"type": "reply", "text": UNSAFE_TEXT, "sources": []})
         return
 

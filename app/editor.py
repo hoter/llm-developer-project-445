@@ -57,6 +57,9 @@ def pick_reply(run: dict, sources: list[str] | None = None) -> str:
                        "<|im_start", "<|im_end"):
             if marker in candidate:
                 candidate = candidate.split(marker, 1)[0]
+        # шаблон малой модели иногда «доигрывает» диалог маркером вида
+        # «…#im_start|user» — это разметка чата, а не текст ответа
+        candidate = re.split(r"\s*(?:[#|]+)(?:im_start|im_end)\b.*", candidate)[0]
         candidate = re.sub(r"\b(user|assistant)\s*$", "", candidate.strip()).strip()
         if candidate:
             cleaned.append(candidate)
@@ -98,7 +101,10 @@ def editor_task(message: str, runs: list[dict]) -> str:
     else:
         blocks = []
         for i, run in enumerate(runs, 1):
-            blocks.append(f"### Доклад {i} — агент {run.get('agent', '?')}\n{run.get('report', '')}")
+            # доклад малой модели может «доиграть» диалог и вызовы: в
+            # редактор идёт только текст ответа, без разметки чата
+            report = clean_text(run.get("report", ""))
+            blocks.append(f"### Доклад {i} — агент {run.get('agent', '?')}\n{report}")
         reports = "\n\n".join(blocks)
     return (
         f"Сообщение абонента: {message}\n\n"
@@ -106,3 +112,16 @@ def editor_task(message: str, runs: list[dict]) -> str:
         "Ответь одним сообщением абоненту по докладам выше. Правила из "
         "базы знаний — с указанием источника."
     )
+
+
+_CHAT_MARKERS = ("<|im_start|>", "<|im_end|>", "||im_start|", "||im_end|", "#im_start", "#im_end")
+
+
+def clean_text(text: str) -> str:
+    """Обрезать доклад до разметки чужого диалога и служебных хвостов."""
+    text = text or ""
+    cut = min((text.find(m) for m in _CHAT_MARKERS if m in text), default=-1)
+    if cut >= 0:
+        text = text[:cut]
+    text = re.split(r"\s*(?:[#|]+)(?:im_start|im_end)\b.*", text)[0]
+    return text.strip().rstrip("|#").strip()

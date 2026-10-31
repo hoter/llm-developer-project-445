@@ -15,7 +15,7 @@ import time
 from agents import Agent, AgentOutputSchema, ModelSettings, Runner
 from agents.items import MessageOutputItem, ToolCallItem, ToolCallOutputItem
 
-from app import audit
+from app import audit, llm_pool
 from core import config, db
 
 
@@ -135,8 +135,12 @@ def _sources_of(value) -> list[str]:
 async def run_agent(agent: Agent, task: str, *, trace_id: str = "") -> dict:
     """Отдельный Runner.run агента → доклад, tool-вызовы и инструменты хода.
 
-    Каждый запуск агента пишется в llm_calls: токены из usage (сумма по
-    всем запросам хода), задержка — вокруг самого запуска. Текст задачи и
+    Модель вызывается через пул провайдеров (клиент, установленный SDK):
+    переключение на запасного происходит внутри клиента, агент об этом не
+    знает. В llm_calls пишется фактический провайдер и модель последнего
+    вызова, стоимость — по цене фактической модели.
+    Каждый запуск пишется в llm_calls: токены из usage (сумма по всем
+    запросам хода), задержка — вокруг самого запуска. Текст задачи и
     ответа в журнал не идёт: там бывают персональные данные.
     """
     started = time.monotonic()
@@ -168,14 +172,19 @@ async def run_agent(agent: Agent, task: str, *, trace_id: str = "") -> dict:
 
 
 def _log_call(agent: Agent, result, trace_id: str, seconds: float) -> None:
-    """Запуск агента → llm_calls (модель, токены, задержка)."""
-    usage = _usage(result) if result is not None else {"input_tokens": 0, "output_tokens": 0}
+    """Запуск агента → llm_calls: фактический провайдер, модель, токены, цена."""
+    counts = _usage(result) if result is not None else {"input_tokens": 0, "output_tokens": 0}
+    usage = llm_pool.POOL.usage() if llm_pool.POOL is not None else llm_pool.Usage()
+    model = usage.model or _model_name(agent)
     try:
         db.execute(
-            "insert into llm_calls(trace_id, agent, model, input_tokens, output_tokens, latency_ms)"
-            " values (%s, %s, %s, %s, %s, %s)",
-            (trace_id, getattr(agent, "name", "?"), _model_name(agent),
-             usage["input_tokens"], usage["output_tokens"], int(seconds * 1000)),
+            "insert into llm_calls(trace_id, agent, model, provider, input_tokens, output_tokens,"
+            " latency_ms, cost_rub, fallbacks)"
+            " values (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
+            (trace_id, getattr(agent, "name", "?"), model, usage.provider or "primary",
+             counts["input_tokens"], counts["output_tokens"], int(seconds * 1000),
+             round(usage.cost_rub(counts["input_tokens"], counts["output_tokens"]), 6),
+             json.dumps(usage.fallbacks, ensure_ascii=False)),
         )
     except Exception:  # noqa: BLE001 — журнал не должен ронять ход
         pass

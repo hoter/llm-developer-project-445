@@ -188,6 +188,34 @@ forbid не нужно. TTL карточки до «да» проверяет PD
 изменилось. Упавшее ожидание видно по `trace_id` хода в `audit_log`,
 `llm_calls` и `tool_calls`.
 
+Минимальный выбор, какие ошибки повторять:
+
+```python
+@staticmethod
+def should_failover(error: Exception) -> bool:
+    if isinstance(error, openai.APIStatusError):
+        status = error.status_code
+        return status == 429 or status >= 500   # 400, 401, 403 — не повторяем
+    return isinstance(error, RETRY_NETWORK_ERRORS)  # таймаут, сеть
+```
+
+- **Пул** — `app/llm_pool.py`: два клиента `AsyncOpenAI` из `.env`, обход
+  пула один раз, пауза провайдеру за 429/5xx (`LLM_FAILOVER_COOLDOWN_SEC`).
+  Пул включается, когда задан `LLM_SECONDARY_BASE_URL`.
+- **Стоимость** — по фактической модели (`LLM_MODEL_PRICES`), в `llm_calls`
+  пишутся провайдер, модель, цена и путь переключения (`fallbacks`).
+- **Встраивание** — на уровне клиента: `Agent` при каждом вызове берёт модель
+  из `Agent.model`, поэтому SDK-клиент пула подменяет её моделью провайдера
+  (`app/llm_proxy.py`). Пересобирать агентов не нужно.
+
+Проверка переключения: запасной сервер поднят на `:1235`, основной адрес
+временно битый (`LLM_BASE_URL=http://127.0.0.1:1299/v1`). Вопрос «какой у меня
+тариф?» получает ответ через запасного, в `llm_calls` у вызовов
+`provider=secondary`, а в `fallbacks` — `{"provider": "primary", "error":
+"APIConnectionError"}`. После возврата основного те же вызовы снова идут с
+`provider=primary`. Ответ 400 переключения не даёт: `should_failover()`
+проверяет только 429, 5xx и сетевые ошибки.
+
 ## Аудит и разбор инцидентов
 
 Каждый ход получает `trace_id`; ходы одного диалога связывает `session_id`.

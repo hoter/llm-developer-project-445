@@ -128,8 +128,17 @@ create table if not exists llm_calls(
     model         text,
     input_tokens  int,
     output_tokens int,
-    latency_ms    int
+    latency_ms    int,
+    -- фактический провайдер модели (primary/secondary) и путь переключения
+    provider      text,
+    cost_rub      numeric(12,6),
+    fallbacks     jsonb
 );
+
+-- миграция для баз, созданных до бонусного шага (идемпотентно)
+alter table llm_calls add column if not exists provider  text;
+alter table llm_calls add column if not exists cost_rub  numeric(12,6);
+alter table llm_calls add column if not exists fallbacks jsonb;
 
 create table if not exists tool_calls(
     id         bigserial primary key,

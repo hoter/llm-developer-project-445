@@ -64,6 +64,16 @@ def wrap_mcp_tool(session: Session, name: str) -> FunctionTool:
                 outcome = "bad_arguments"
                 return json.dumps({"error": "bad_arguments", "detail": "аргументы — JSON-объект"},
                                   ensure_ascii=False)
+            # модель повторяет тот же вызов по уже подготовленному действию:
+            # отвечаем карточкой, а не плодим вызовы до лимита хода. Подготовка
+            # идемпотентна: новая карточка просто заменит прежнюю того же
+            # действия, а карточка другого действия не должна теряться.
+            existing = session.pending_card
+            if (name in PREPARE_ACTIONS and existing is not None
+                    and existing.action == PREPARE_ACTIONS[name]
+                    and (getattr(ctx, "retried", False) or name in session.trace)):
+                outcome = "repeated"
+                return json.dumps(_card_answer_json(session, existing), ensure_ascii=False)
             # барьер 2: тройка «субъект, операция, объект» в момент вызова
             decision = permissions.admit(session.allowlist, name, args)
             if not decision.allowed:
@@ -149,6 +159,18 @@ def _public_schema(schema: dict) -> dict:
     schema["properties"] = properties
     schema["required"] = required
     return schema
+
+
+def _card_answer_json(session: Session, card) -> dict:
+    """Ответ модели по уже живой карточке: пересказать и спросить «да/нет»."""
+    return {
+        "card_created": True,
+        "pending_id": card.pending_id,
+        "card": card.public_view(config.CARD_TTL_SEC),
+        "summary": "",
+        "next": "перескажи карточку и спроси подтверждение «да/нет»",
+        "already_prepared": True,
+    }
 
 
 async def _card_answer(session: Session, name: str, result: dict) -> dict | None:
